@@ -202,14 +202,14 @@ Here's the complete async TAP query flow with the new design:
 ##### Job Execution
 
   - Client requests job phase change to EXECUTING
-  - When client changes job phase to EXECUTING, TAP service submits query to QServ via HTTP API and stores returned QServ query ID as the UWS `runID` parameter
+  - When client changes job phase to EXECUTING, TAP service submits query to QServ via HTTP API and stores returned QServ query ID as a UWS parameter, which one exactly is tbd.
   - QServ processes query across its distributed workers, updating status which TAP service can check via `/query-async/status/:queryId`
   - Upon completion, QServ writes results directly to GCS in VOTable format (XML with binary2 serialization) using predetermined bucket/path convention
 
 ##### Status Monitoring
 
    - Client periodically checks job status via UWS interface
-   - System retrieves QServ status using stored QServ query ID (Stored as UWS runID)
+   - System retrieves QServ status using stored QServ query ID (Stored in a UWS field)
    - Maps QServ progress info to UWS job parameters
    - Reports execution phase (EXECUTING, COMPLETED, ERROR, ABORTED)
   
@@ -431,6 +431,7 @@ public class HttpQServQueryRunner implements JobRunner {
                 createParameters()
             );
             job.setRunID(queryJob.getId());  // Store QServ ID for tracking
+            // Note this examples sets it as a runID, but this is not applicable so we need to store it elsewhere
         
             if (syncOutput != null) {
                 // Synchronous execution
@@ -688,7 +689,7 @@ The QServ HTTP API endpoints could also benefit from monitoring to ensure servic
 
 ####  Operational Procedures
 
-The transition also potentially updates query management procedures and troubleshooting methods. The direct mapping of UWS runID to QServ query ID provides clear traceability and makes the process of investigating queries and resolving issues easier.
+The transition also potentially updates query management procedures and troubleshooting methods. The direct mapping of UWS query ID (tbd, not jobRef or runID) to QServ query ID provides clear traceability and makes the process of investigating queries and resolving issues easier.
 
 
 ### 4.3 Risks and Mitigations
