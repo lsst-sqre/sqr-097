@@ -138,6 +138,93 @@ The current API returns results in a JSON format that, while comprehensive, requ
 
 Adding VOTable support is a key change that allows us to skip an extra deserialization / serialization step.
 
+However this introduces an additional challenge, as QServ will not have the additional context needed to generate the header metadata which includes information like types, UCD's column descriptions etc, which are available in the TAP_SCHEMA database. There are a few potential ways we could address this:
+
+Combined Query Approach:
+
+When submitting a query to QServ, include the necessary metadata in the request payload. This keeps the operation atomic while giving QServ the context it needs.
+
+Example: 
+```
+{
+    "query": "SELECT ra, dec FROM Object",
+    "metadata": {
+        "ra": {
+            "ucd": "pos.eq.ra",
+            "unit": "deg",
+            "description": "Right ascension"
+        },
+        "dec": {...}
+    }
+}
+```
+
+Passing the complete VOTable header XML in the query request:
+
+QServ would only need to:
+
+- Insert the provided header XML
+- Generate the data rows in VOTable format
+- Close the XML structure
+
+```
+{
+    "query": "SELECT ra, dec FROM Object",
+    "votable_header": "<VOTABLE version='1.4'><RESOURCE type='results'><TABLE><FIELD name='ra' ID='ra' datatype='double' unit='deg'><DESCRIPTION>Right ascension</DESCRIPTION></FIELD>...</TABLE>",
+    "format": "votable"
+}
+```
+
+Another alternative if the above are suboptimal for QServ, would be to have QServ provide only the data portion of the VOTable structure. 
+Ideally this would be serialized as a BINARY2 stream, with an optional alternative being TABLEDATA. 
+
+This would allow us to avoid reduntant serialization/deserialization steps.
+
+Binary2:
+```
+<!-- VOTable header created by TAP service -->
+<VOTABLE version="1.4">
+<RESOURCE type="results">
+<TABLE>
+<FIELD name="ra" datatype="double" unit="deg">...</FIELD>
+<FIELD name="dec" datatype="double" unit="deg">...</FIELD>
+<DATA>
+  <!-- QServ provides just this BINARY2 section -->
+  <BINARY2>
+    <STREAM encoding="base64">
+      QEEAAAAAAAAAgD/wAAAAAAAA...
+    </STREAM>
+  </BINARY2>
+</DATA>
+</TABLE>
+</RESOURCE>
+</VOTABLE>
+```
+
+Tabledata:
+
+```
+<VOTABLE version="1.4">
+<RESOURCE type="results">
+<TABLE>
+<FIELD name="ra" datatype="double" unit="deg">...</FIELD>
+<FIELD name="dec" datatype="double" unit="deg">...</FIELD>
+<DATA>
+ <!-- QServ provides just this TABLEDATA section -->
+ <TABLEDATA>
+   <TR><TD>123.45</TD><TD>-45.67</TD></TR>
+   <TR><TD>234.56</TD><TD>-56.78</TD></TR>
+ </TABLEDATA>
+</DATA>
+</TABLE>
+</RESOURCE>
+</VOTABLE>
+```
+
+This would be requested by specifying the format in the request as:
+
+`GET /query-async/result/123?format=votable_binary2`
+	
 #### Storing results
 
 A main difference of the architecture proposed here is that handling the results now shifts towards the QServ Service. Specifically QServ upon completion would write the results out to the GCS bucket and the URL for this file would be communicated back to the TAP Service upon request of the results. 
@@ -202,13 +289,13 @@ Here's the complete async TAP query flow with the new design:
 ##### Job Execution
 
   - Client requests job phase change to EXECUTING
-  - When client changes job phase to EXECUTING, TAP service submits query to QServ via HTTP API and stores returned QServ query ID as a UWS parameter, which one exactly is tbd.
+  - When client changes job phase to EXECUTING, TAP service submits query to QServ via HTTP API and stores returned QServ query ID as a UWS parameter, which one exactly is to be determined.
   - QServ processes query across its distributed workers, updating status which TAP service can check via `/query-async/status/:queryId`
   - Upon completion, QServ writes results directly to GCS in VOTable format (XML with binary2 serialization) using predetermined bucket/path convention
 
 ##### Status Monitoring
 
-   - Client periodically checks job status via UWS interface
+   - A TAP Client (i.e. pyvo, Firefly or TopCat) periodically checks job status via UWS interface
    - System retrieves QServ status using stored QServ query ID (Stored in a UWS field)
    - Maps QServ progress info to UWS job parameters
    - Reports execution phase (EXECUTING, COMPLETED, ERROR, ABORTED)
@@ -254,13 +341,13 @@ Asynchronous TAP Query Request Flow
 ##### Query Submission
 
    - Client submits query with using sync API
+   - Existing CADC TAP services create a UWS job for synchronous queries as well, so we maintain this design and do the same
    - System (TAP) submits to QServ synchronous endpoint
-   - Existing CADC TAP services create a UWS job for synchronous queries as well, so we maintain this design and do the same.
-   - TAP Service waits for completion, and polls the QServ job status on regular intervals (HTTP GET /query-async/status/:queryId)
-
+   - TAP Service waits for completion and once results are returned updates the UWS job
+   
 ##### Result Streaming
 
-   - Upon job completion, the TAP service requests the results from the QServ API
+   - Upon job completion, the QServ API streams the results back to the TAP service, which then returns these results to the user
    - The results are streamed directly to client in VOTable format
    - Connection maintained until complete
 
@@ -625,7 +712,7 @@ The TAP service will map these errors to appropriate TAP/UWS error states and VO
 
 ### 3.6 Connection Pool Configuration
 
-The HTTP client should be configured with settings appropriate for astronomical query workloads:
+The HTTP client should be configured with settings appropriate for the long-running QServ query workloads:
 ```
 HttpClient.newBuilder()
     .connectTimeout(Duration.ofSeconds(10))
