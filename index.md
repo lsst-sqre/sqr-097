@@ -1,7 +1,13 @@
-# Integrating QServ HTTP API into RSP TAP services
+# TAP over QServ using an event-based architecture
 
 ```{abstract}
-The existing CADC-based TAP services that the RSP deploys use JDBC connections to run queries on the QServ catalog data. The current setup lacks crucial query control capabilities - specifically, the ability to stop or monitor long-running queries over large datasets. The QServ team have developed a prototype HTTP REST API which can be used to drive queries. This technote proposes a design where we modify and extend the existing TAP service software to enable integration and use of this new API to allow driving queries via HTTP.
+The existing CADC-based TAP services that the RSP deploys use JDBC connections to run queries on the QServ catalog data. 
+The current setup lacks crucial query control capabilities - specifically, the ability to stop or monitor long-running queries over large datasets. 
+We propose a new event-based architecture that decouples the TAP service from 
+QServ. This architecture utilizes Kafka queues as the means for messaging 
+between TAP and QServ, with a plan to take advantage of existing systems 
+and knowledge (Sasquatch, Strimzi), to enable asynchronous query execution 
+with capabilities for query cancellation and monitoring.
 ```
 
 ## 1. Introduction
@@ -22,10 +28,6 @@ These types of queries have the potential to overwhelm the system at high concur
 
 The use-case scenario we would like to support that is not currently possible is allowing users to identify that a query has been running longer than they expected, to stop this potentially inefficient query, modify its parameters and restart it.
                                                 
-The new QServ HTTP API makes it possible to address these limitations by providing native query cancellation support, real-time progress monitoring and improved status reporting. 
-
-Beyond addressing immediate operational needs, we identify components within the TAP library where it would be possible to abstract the underlying storage solution from the TAP execution layer, allowing us, as well as other operators of the CADC TAP service to more flexibly move between different solutions if needed.
-
 
 ### 1.3 Goals and Requirements
 
@@ -34,10 +36,11 @@ Beyond addressing immediate operational needs, we identify components within the
 The primary goals for this transition are: 
 
 - Enhance control over query execution 
+- Decouple TAP service from underlying data store to allow for more flexibility in the future
 - Enable a core feature of allowing cancellation of running queries
-- Abstractions in the CADC TAP service that separate the query execution layer from the underlying storage implementation 
 - Get detailed information about query execution such as progress metrics & status updates.
-- Backward Compatibility. Also any changes should be transparent to the user and not change any of the observed behaviour of the TAP service
+- Backward Compatibility. Also, any changes should be transparent to the 
+  user and not change any of the observed behaviour of the TAP service
 
 #### Requirements
 
@@ -47,825 +50,614 @@ The primary goals for this transition are:
 - Ability to scale to a large number of concurrent users (1-10k initially)
 
 
-## 2. QServ HTTP API Analysis
+## 2. System Architecture
 
-### 2.1 Overview
-
-QServ's HTTP API provides a REST interface for managing QServ queries including running, monitoring and control. 
-The API supports both synchronous and asynchronous query execution and provides descriptive status reports and query management capabilities.
-The interface is version-controlled through either a pull or push mode described in the [QServ](https://qserv.lsst.io/user/http-frontend.html) documentation.
-
-
-### 2.2 Key Features
-
-The API offers several key capabilities essential for queries to the Rubin catalog data:
-
-#### Query Execution Control
-
-The API provides both synchronous and asynchronous query interfaces. The asynchronous interface offers a query ID that can be used for monitoring and control. 
-
-#### Progress Monitoring
-
-The status endpoint provides detailed execution statistics, including the number of completed chunks, execution start time, and last update time. 
-Status information is available through `/query-async/status/:queryId`, providing: 
-
-- Total and completed chunk counts 
-- Query start and last update timestamps 
-- Execution state information 
-- Distributed processing metrics
-
-#### Result Retrieval 
-
-Results are accessed through `/query-async/result/:queryId` with support for: 
-
-- Schema information including column types 
-- Row-based data representation 
-- Multiple binary data encoding options (hex, base64, array)
-
-In the current implementation, once results are fetched they are deleted on the QServ side. This means that attempts to refetch the data will fail with an error message. This requires careful consideration depending on our approach and specifically in the case where the TAP service requests and streams the results from QServ to TAP via this endpoint.
-
-#### Query Management
-
-The API includes endpoints for query cancellation. This allows users (or an admin service or person) to terminate queries that are taking too long or consuming excessive resources.
-
-The API provides query cancellation through a DELETE request to `/query-async/<queryId>`. For example, to cancel query 123: 
-```
-HTTP DELETE /query-async/123?version=39
-```
-
-A successful cancellation returns:
-
-```
-{
-    "success": 1
-}
-```
-
-The query state will transition to ABORTED, and this state change can be observed through the status endpoint.
-
-
-#### User Table Management
-
-The QServ HTTP API also provides functionality for managing user-defined tables in QServ. 
-This includes table creation, data ingestion, and deletion operations. 
-
-Two options for ingesting table data are supported:
-
-- `application/json`: Both data and metadata are encapsulated into a single JSON object sent in the request body.
-
-- `multipart/form-data`: The data is sent as a CSV-formatted file, and metadata is encapsulated in separate JSON objects. All this information is packaged into the body of a request.
-
-The API enforces naming conventions for user databases and tables to prevent conflicts with production data. 
-User databases must follow the pattern `user_<username>`, while table names cannot start with the `qserv_` prefix which is reserved for internal QServ tables.
-
-There are both synchronous and asynchronous modes through which tables can be ingested and the service provides options for defining schema, index creation, binary data handling though there are some limitations in terms of table sizes when using the JSON ingestion method.
-
-This endpoint could be relevant to the RSP TAP services both in terms of providing TAP_UPLOAD for TAP services that are backed by a QServ database, as well as for user-uploaded tables. Both cases would require development effort to enable use of the API in the TAP library code, and would probably benefit from a standalone technote outlining the steps required.
-
-
-### 2.3 Proposed Changes
-
-While the API provides essential functionality, there are a few areas which could be adjusted to make integration with the RSP (CADC) TAP service easier:
-
-
-#### VOTable Support
-
-The current API returns results in a JSON format that, while comprehensive, requires conversion into XML (VOTable) for TAP compatibility. We recommend:
-- Adding direct VOTable output support for query results
-- Including proper astronomical metadata (units, UCDs)
-- Supporting different serialization formats (binary2, tabledata). We don't necessarily need both and binary2 would be the preferred option, though if it is possible to have both as optional formats that would be ideal
-- Maintaining JSON output for the rest of the query management API
-
-Adding VOTable support is a key change that allows us to skip an extra deserialization / serialization step.
-
-However this introduces an additional challenge, as QServ will not have the additional context needed to generate the header metadata which includes information like types, UCD's column descriptions etc, which are available in the TAP_SCHEMA database. There are a few potential ways we could address this:
-
-Combined Query Approach:
-
-When submitting a query to QServ, include the necessary metadata in the request payload. This keeps the operation atomic while giving QServ the context it needs.
-
-Example: 
-```
-{
-    "query": "SELECT ra, dec FROM Object",
-    "metadata": {
-        "ra": {
-            "ucd": "pos.eq.ra",
-            "unit": "deg",
-            "description": "Right ascension"
-        },
-        "dec": {...}
-    }
-}
-```
-
-Passing the complete VOTable header XML in the query request:
-
-QServ would only need to:
-
-- Insert the provided header XML
-- Generate the data rows in VOTable format
-- Close the XML structure
-
-```
-{
-    "query": "SELECT ra, dec FROM Object",
-    "votable_header": "<VOTABLE version='1.4'><RESOURCE type='results'><TABLE><FIELD name='ra' ID='ra' datatype='double' unit='deg'><DESCRIPTION>Right ascension</DESCRIPTION></FIELD>...</TABLE>",
-    "format": "votable"
-}
-```
-
-Another alternative if the above are suboptimal for QServ, would be to have QServ provide only the data portion of the VOTable structure. 
-Ideally this would be serialized as a BINARY2 stream, with an optional alternative being TABLEDATA. 
-
-This would allow us to avoid reduntant serialization/deserialization steps.
-
-Binary2:
-```
-<!-- VOTable header created by TAP service -->
-<VOTABLE version="1.4">
-<RESOURCE type="results">
-<TABLE>
-<FIELD name="ra" datatype="double" unit="deg">...</FIELD>
-<FIELD name="dec" datatype="double" unit="deg">...</FIELD>
-<DATA>
-  <!-- QServ provides just this BINARY2 section -->
-  <BINARY2>
-    <STREAM encoding="base64">
-      QEEAAAAAAAAAgD/wAAAAAAAA...
-    </STREAM>
-  </BINARY2>
-</DATA>
-</TABLE>
-</RESOURCE>
-</VOTABLE>
-```
-
-Tabledata:
-
-```
-<VOTABLE version="1.4">
-<RESOURCE type="results">
-<TABLE>
-<FIELD name="ra" datatype="double" unit="deg">...</FIELD>
-<FIELD name="dec" datatype="double" unit="deg">...</FIELD>
-<DATA>
- <!-- QServ provides just this TABLEDATA section -->
- <TABLEDATA>
-   <TR><TD>123.45</TD><TD>-45.67</TD></TR>
-   <TR><TD>234.56</TD><TD>-56.78</TD></TR>
- </TABLEDATA>
-</DATA>
-</TABLE>
-</RESOURCE>
-</VOTABLE>
-```
-
-This would be requested by specifying the format in the request as:
-
-`GET /query-async/result/123?format=votable_binary2`
-	
-#### Storing results
-
-A main difference of the architecture proposed here is that handling the results now shifts towards the QServ Service. Specifically QServ upon completion would write the results out to the GCS bucket and the URL for this file would be communicated back to the TAP Service upon request of the results. 
-
-#### HTTP Status Code Usage
-
-The current implementation always returns HTTP 200, using a success flag in the JSON response to indicate status. This deviates from REST best practices and complicates error handling. We propose:
-- Using standard HTTP status codes (400 for client errors, 500 for server errors)
-- Maintaining detailed error information in the response body
-- Aligning error reporting with TAP error patterns
-
-#### Additional Enhancement Opportunities
-
-Adding estimated completion time to status responses would be one additional enhancement that would allow us to communicate up-to-date progress information to users/clients
-
-#### Query Validation Endpoint
-
-A new `/validate` endpoint would provide pre-flight query validation, allowing verification of query correctness and efficiency before actual execution. This endpoint could be integrated into the TAP service's query processing pipeline to perform early validation, potentially rejecting problematic queries before they reach the database engine. This would be particularly valuable for:
-
-- Syntax validation
-- Potential performance issues
-- Expected execution cost
-- Query optimization suggestions
-- Required resources
-
-The implementation specifics and ultimate utility of this endpoint would need further evaluation, particularly in terms of its ability to provide meaningful validation without becoming a performance bottleneck itself. The effectiveness of the validation would depend on how well it can predict actual query behavior without full execution.
-
-Overall, of the proposed changes VOTable support and storing results in GCS would be the more important changes in order to implement the architecture described in the technote, while 3-5 are small user-experience better or client implementation cleaner.
- 
-
-## 3. Implementation Strategy
+### 2.1 System Architecture Diagram
 
 The figure below illustrates the system architecture demonstrating the interactions between TAP and QServ during query execution. 
 
-The key interaction paths shown include:
-1. Query submission and job management between clients and the TAP service
-2. Query execution and monitoring through QServ's HTTP API
-3. Direct result storage from QServ to GCS
-4. Result access via TAP service redirection
-
-
-```{figure} system_design.png
+```{figure} tap-qserv-event-based.png
 :figclass: technote-wide-content
 :scale: 50%
 
 System Architecture
 ```
 
+### Core Components
+- TAP Service: CADC TAP service
+- UWS Database: Stores job information and status
+- QServ: Distributed database with HTTP REST API for query execution
+- Kafka (Sasquatch): Event streaming platform
+- Google Cloud Storage (GCS): Store Query VOTable results
 
-### 3.1 Proposed TAP query execution flow:
-
-#### Asynchronous TAP Query
-
-Here's the complete async TAP query flow with the new design:
-
-##### Job Creation
-
-  - Client creates a UWS job via TAP service with their query parameters
-  - System validates parameters
-  - Returns job identifier to client
-
-##### Job Execution
-
-  - Client requests job phase change to EXECUTING
-  - When client changes job phase to EXECUTING, TAP service submits query to QServ via HTTP API and stores returned QServ query ID as a UWS parameter, which one exactly is to be determined.
-  - QServ processes query across its distributed workers, updating status which TAP service can check via `/query-async/status/:queryId`
-  - Upon completion, QServ writes results directly to GCS in VOTable format (XML with binary2 serialization) using predetermined bucket/path convention
-
-##### Status Monitoring
-
-   - A TAP Client (i.e. pyvo, Firefly or TopCat) periodically checks job status via UWS interface
-   - System retrieves QServ status using stored QServ query ID (Stored in a UWS field)
-   - Maps QServ progress info to UWS job parameters
-   - Reports execution phase (EXECUTING, COMPLETED, ERROR, ABORTED)
-  
-##### Result Retrieval
-
-   - Client requests results using UWS Job URL.
-   - TAP Service checks if UWS results column is set. If not it fetches it from the QServ results endpoint, i.e. GET /query-async/result/:queryId
-   - The TAP service stores the url to the result in the UWS table 
-   - Client is redirected to GCS bucket with results 
-   - When client requests the UWS job results, TAP service redirects them to the GCS location which follows the pattern https://gcs-bucket/results/result-{queryId}.xml
-   
-##### Query Cancellation
-
-   - Client requests job phase to be changed to ABORTED
-   - System uses stored QServ query ID to cancel via API
-   - Updates job phase accordingly
-
-This design removes result handling from TAP service while maintaining the standard TAP/UWS interface for clients. The key change is that instead of TAP service managing result transfer and storage, QServ writes directly to GCS using an agreed-upon location convention.
-
-It leverages each component's strengths:
-
-- TAP service handles the user interface and job management
-- QServ handles query execution and result generation
-- GCS provides reliable storage for the results
-- Each component has a single & clear responsibility
-
-This architecture should help address the goals and requirements described previously and maintain efficiency since there is no duplicate data transfer or unnecessary hops, as the results flow directly from QServ to GCS, while at the same time having an agreed-upon location convention eliminates any need for explicit coordination between QServ and TAP.
-
-This design should also scale well with increased usage as well as data (query result) volumes since the large result files go directly to storage, there is no memory pressure on TAP service and we make efficient use of network resources.
+### Key Technical Elements
+- Job ID Correlation: We’ll maintain a mapping between uws jobID and qservID
+This may be done as an additional field in the UWS table (qservID)
+- Signed URLs: We may be able to use signed URLs as a means for QServ to write to GCS without credential management
+- VOTable Envelope: TAP service will provide the metadata structure which QServ is unaware of, so that it can then simply insert the data
+- Event-Driven Processing: Decouples components for better scalability and allows us to later use alternative Query back-end mechanisms
 
 
-```{figure} async_flow.png
-:figclass: technote-wide-content full-width
-:scale: 50%
+### 2.2 Proposed TAP query execution flow (asynchronous queries):
 
-Asynchronous TAP Query Request Flow
-```
+#### Job Create Flow
 
+- User submits a create job request. 
+- TAP service creates a record in the UWS database and sets the status to 
+  HELD
 
-#### Synchronous TAP Query
-
-##### Query Submission
-
-   - Client submits query with using sync API
-   - Existing CADC TAP services create a UWS job for synchronous queries as well, so we maintain this design and do the same
-   - System (TAP) submits to QServ synchronous endpoint
-   - TAP Service waits for completion and once results are returned updates the UWS job
-   
-##### Result Streaming
-
-   - Upon job completion, the QServ API streams the results back to the TAP service, which then returns these results to the user
-   - The results are streamed directly to client in VOTable format
-   - Connection maintained until complete
-
-```{figure} sync_flow.png
-:figclass: technote-wide-content full-width
-:scale: 60%
-
-Synchronous TAP Query Request Flow
-```
-
-There is an optional alternative path where the results are written to GCS, and the TAP service upon completion of the job makes a request to the GCS bucket to fetch the results and stream them back to the user. This adds additional latency and complexity, with the main benefit being consistent behaviours between the two and persistence of the results (even though it’s most likely that these will be garbage collected eventually anyway). The nature of synchronous queries probably is better suited for the initial proposed solution where results are not written to GCS.
-
-The key differences from async are:
-
-- Client connection remains open
-- TAP service actively monitors completion instead of client polling
-- Results stream through TAP service to client rather than client being redirected to GCS
-- UWS job is used for record-keeping rather than client interaction
-
-
-### 3.3 TAP Implementation Changes
-
-The current CADC TAP implementation has a few areas where there is coupling to relational databases that would need to be addressed to support the QServ HTTP API integration.
-For a bit more context, our TAP services are built off of the CADC TAP library while introducing Rubin-specific customizations through our own extension layer. 
-Ideally, to best support the QServ HTTP API integration and decouple the codebase from JDBC, changes would be needed in both the core CADC TAP library and our extension layer.
-
-However, if upstream modifications cannot align with our timeline, we can implement the necessary changes within our extension layer, however this would require some complext adaptations to bridge between the JDBC-oriented base library and our QServ HTTP API.
-
-
-#### Current JDBC Dependencies
-
-The key areas of JDBC coupling in the current implementation are:
-
-**Direct use of `java.sql.ResultSet` throughout the codebase:**
-```
-// Current TableWriter interface
-public interface TableWriter {
-    void write(ResultSet rs, OutputStream out) throws IOException;
-    void write(ResultSet rs, OutputStream out, Long maxrec) throws IOException;
-}
-```
-
-
-**JNDI DataSource configuration in QServQueryRunner:**
-
-```
-protected DataSource getQueryDataSource() throws Exception {
-    Context initContext = new InitialContext();
-    Context envContext = (Context) initContext.lookup("java:comp/env");
-    return (DataSource) envContext.lookup(qservDataSourceName);
-}
-```
-
-**Direct SQL connection management:**
-```
-connection.setAutoCommit(false);
-pstmt = connection.prepareStatement(sql);
-pstmt.setFetchSize(1000);
-resultSet = pstmt.executeQuery();
-```
-
-#### Proposed Abstraction Layer
-
-To remove these dependencies, we propose introducing a new abstraction layer:
-
-**QueryService interface**
-
-This provides an abstraction where either a Relational Database, or a Result store behind an API as in our case is used in the same way.
-
-```
-public interface QueryService {
-    // Core query operations
-    QueryJob submitQuery(String query, Map<String, String> parameters);
-    QueryStatus getStatus(String queryId);
-    void cancelQuery(String queryId);
+#### Job Run Flow
     
-    // Result handling
-    ResultData getResults(String queryId);
-}
-```
+#### TAP Service:
 
-**ResultData interface**
+- User submits a request to execute a UWS job
+- TAP service performs query validation, transformation to QServ SQL, and 
+  extracts select list with metadata and generates the VOTable envelope
+- (Optional) TAP service updates the status of the job to QUEUED
+- TAP service publishes a message to the run_query Kafka topic
+- Nothing else required at this point from the TAP Service.
 
-Rather than using JDBC ResultSet we could introduce a ResultData interface to the relevant sections of the code where the JDBC results are parsed.
-This abstraction would aid in not having to customize too far up the class hierarchy and just use the methods with our own adaptation of the result output.
+#### QServ:
 
-```
-// Query result abstraction to replace ResultSet
-public interface ResultData {
-    List<ColumnInfo> getColumns();
-    Stream<List<Object>> getRows();
-    long getRowCount();
-}
+- QServ pulls an event from run_query Kafka queue
+- QServ sends out a job_status update event with status = EXECUTING 
+  and begins the query execution
+- Upon completion, it serializes the results as a VOTable (XML), using the VOTable envelope provided, ideally using BINARY2 serialization.
+- QServ writes the results to the GCS bucket, using the signed URL provided
+- Upon successful writing, it sends out an event to the job_status with the 
+  status of the job (COMPLETED / FAILED / ABORTED).
 
-```
+#### TAP Service:
 
-A slight alternative to the above could be that we instead write a result adapter which implements the ResultSet class.
-```
-public class QServResultSetAdapter implements ResultSet {
-    private final List<Map<String, Object>> rows;
-    private final List<ColumnDefinition> columns;
-    private int currentRow = -1;
+- TAP Service pulls events from job_status.
+- It then updates the UWS database with the metadata provided in that event.
+- Events in this case may indicate a Completed job, a job that failed along with metadata on reasons for the failure, or a status of RUNNING to indicate that the job is now executing. 
+We may also choose to include progress information here which is available in QServ, like how many chunks out of the total have completed. 
+This can then be added to the jobdetail UWS table and become available via the UWS job endpoint.
+ 
+#### Result Retrieval Flow
+
+- User requests results from the TAP service
+- TAP service redirects the user to the GCS URL with the results file
+- User (client) downloads the result file
+
+
+### 2.3 Proposed TAP query execution flow (synchronous queries):
+
+The initial consideration here is to use a sync-over-async mechanism.
+
+In practice, this would mean that as a user makes a sync request, we open a 
+blocking thread which runs the UWS async process until the job is completed.
+
+There are a few possible approaches to how the completion notification will 
+occur:
+
+Option #1: The thread polls the UWS table for updates to the job, perhaps 
+with some sort of exponential back-off to ensure we are not overloading the 
+database with traffic. 
+
+This is the simplest approach, though it does come with the downside of 
+introducing additional traffic to the UWS database. We'll need to run some scalability tests to see how this would affect the system
+and decide whether this is a viable approach.
+
+Option #2: We maintain a Semaphore in the TAP Service through the use of a REDIS instance. 
+The thread that is waiting for the job to complete will wait on this semaphore, and the UWS job update process will release the semaphore when the job is completed. 
+This would be a more efficient approach, but it does introduce some complexity in the system.
+
+Another consideration would be to actually make the UWS dabatase a REDIS 
+instance. This would allow us to get around the scalability issues of 
+having to poll the database and would allow us to use the semaphore
+approach without having to introduce another service.
+However, we would lose the persistence of the UWS database, which in our 
+current plans serves as the Query History source. There are ways to 
+workaround this, perhaps by syncing the job status to a single Wobbly 
+UWS database which Firefly and Nublado could use as the source of query 
+history. 
+
+In any case this is probably quite a complex change, so the initial
+approach is probably to stick with Option #1 and see how it performs, 
+before deciding if we need to move to a more complex solution.
+
+
+#### Job Delete Data Flow
     
-    public QServResultSetAdapter(QServQueryResponse response) {
-        this.columns = parseColumns(response.schema());
-        this.rows = parseRows(response.rows());
-    }
-    
-    // Rest of implementation here..
-}
-```
-This approach would allow us to maintain most of the existing TAP codebase by adapting QServ's JSON response format to the JDBC ResultSet interface. 
-The existing TAP components could continue operating as before, with the adapter providing a bridge between the HTTP API responses and the expected JDBC interfaces.
+#### TAP Service:
 
-The main benefit would be simplicity of integration, since we could introduce the QServ HTTP API with minimal changes to the TAP service code. 
-The `TableWriter` implementations and result handling code would continue functioning without modification, so this provides a clear migration path with lower risk.
+- Upon receiving a request to delete a job send an event to the delete_query 
+topic
+- Update the status of the UWS job to set it to DELETED
 
-However, implementing a complete `ResultSet` interface requires significant effort and may introduce complexity in maintaining compatibility between QServ's native response format and JDBC's expectations. 
-We would also be masking the true nature of the implementation, which could make debugging more difficult. 
-Also some `ResultSet` features like transaction isolation and updatable result sets have no clear mapping to the HTTP API model.
+#### QServ:
+
+- Upon receiving a request to delete a job, stop and delete query
 
 
+A detail here to be ironed out is whether we should set the job to DELETED in UWS regardless of what happens on the 
+QServ side, or if we instead add another interaction step where we wait for 
+a job status update from QServ which will then set the job to DELETED.
 
-**QServQueryService implementation**
+If we go with the second approach, we may run into the following scenario:
+- User asks to delete a job.
+- User asks to see this job, which has a status of COMPLETED instead of 
+  DELETED.
 
-Our implementation of the QueryService interface for QServ might look something like this:
-```
-public class QServQueryService implements QueryService {
-    private final QServHttpService httpService;
-    
-    @Override
-    public QueryJob submitQuery(String query, Map<String, String> parameters) {
-        String qservId = httpService.submitQuery(query, createContext(parameters));
-        return new QueryJob(qservId, query, parameters);
-    }
-    
-    @Override
-    public QueryStatus getStatus(String queryId) {
-        return httpService.getStatus(queryId);
-    }
-    
-    @Override
-    public ResultData getResults(String queryId) {
-        // For async queries, return URL to GCS storage
-        String gcsUrl = httpService.getResultLocation(queryId);
-        return new GCSResultData(gcsUrl);
-    }
-}
-```
+Therefore, it probably makes to go with the first approach and set the job to DELETED in UWS regardless of what happens on the QServ side.
 
-**Modified QServQueryRunner (or new implementation)**
 
-We would then either introduce a new QueryRunner class, or modify the existing QServQueryRunner to utilize the above:
-```
-public class HttpQServQueryRunner implements JobRunner {
-    private final QueryService queryService;  // New abstraction
-    private final JobUpdater jobUpdater;
-    private final ResultStore resultStore;
-    
-    // Remove JDBC DataSource methods
-    // Remove getQueryDataSource(), getTapSchemaDataSource(), getUploadDataSource()
+#### TAP Upload Data Flow
 
-    private void doIt() {
-        try {
-            // Submit query to QServ
-            QueryJob queryJob = queryService.submitQuery(
-                query.getSQL(), 
-                createParameters()
-            );
-            job.setRunID(queryJob.getId());  // Store QServ ID for tracking
-            // Note this examples sets it as a runID, but this is not applicable so we need to store it elsewhere
-        
-            if (syncOutput != null) {
-                // Synchronous execution
-                streamResults(queryJob);
-            } else {
-                // Async execution - monitor until complete
-                monitorQuery(queryJob);
-            }
-        } catch (Exception e) {
-           handleError(e);
-        }
-    }
-}
-```
+The TAP Upload process will look something like this:
 
-**Modified Result Handling**
+#### TAP Service:
+- Upon receiving a request to do a TAP_UPLOAD query, we take the uploaded file 
+  and push it to GCS. 
+- Send the GCS URL along with a name for the file to the upload_table topic 
+  as additional metadata in the run_query event.
 
-The result handling flow needs to change to accommodate both direct streaming and GCS storage:
+#### QServ:
 
-```
-public class QServTableWriter implements TableWriter {
-    private final QueryService queryService;
-    
-    @Override
-    public void write(ResultData results, OutputStream out) throws IOException {
-        if (results instanceof GCSResultData) {
-            // For async queries, redirect to GCS
-            String gcsUrl = ((GCSResultData) results).getUrl();
-            redirectToGCS(gcsUrl);
-        } else {
-            // For sync queries, stream directly
-            writeVOTable(results, out);
-        }
-    }
-}
-```
-The async write is slightly odd here in the case where it is handled by QServ, since the TAP service is not writing out any results, so perhaps we may end up doing nothing in the async/write case.
+- Upon receiving a request to upload a user table, use the GCS URL to upload 
+the file into QServ.
+- Once table has been uploaded, initialize the query and send a topic to 
+  job_status with status = EXECUTING
+- Upon completion, send an event to the job_status topic with the status of 
+  the job (COMPLETED / FAILED / ABORTED).
+- Delete table from QServ
 
-**Cancelling Queries**
 
-In the RSP implementation we use a `QueryJobManager` which extends `SimpleJobManager` for UWS Job management. Cancelling a query will be triggered when a UWS job is set to "ABORTED" either by a user or a system action.
+## 3.  Event Schemas
 
-In the `SimpleJobManager` this is the abort method:
+## 3.1 Job run
 
-```
-    @Override
-    public void abort(String requestPath, String jobID)
-            throws JobNotFoundException, JobPersistenceException, JobPhaseException, TransientException {
-        JobPersistence jobPersistence = getJobPersistence(requestPath);
-        Job job = jobPersistence.get(jobID);
-        doAuthorizationCheck(job);
-        JobExecutor jobExecutor = getJobExecutor(requestPath, jobPersistence);
-        jobExecutor.abort(job);
-    }
-```
+### Job run Topic Schema
 
-In addition, the other relevant class used here is the JobPersistense class, which in our case is a `PostgresJobPersistence` which extends `DatabaseJobPersistence`. In `DatabaseJobPersistence` the delete method is the following:	
-
-```
-    public void delete(String jobID)
-        throws JobPersistenceException, TransientException
     {
-        JobDAO dao = getDAO();
-        dao.delete(jobID);
+      "type": "object",
+      "required": ["query", "jobID", "ownerID", "resultDestination", "resultFormat"],
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "The SQL query to be executed by QServ"
+        },
+        "database": {
+          "type": "string",
+          "description": "The database to query, e.g., 'dp1'"
+        },
+        "jobID": {
+          "type": "string",
+          "description": "UWS job identifier for correlation"
+        },
+        "ownerID": {
+          "type": "string",
+          "description": "User identifier who submitted the query"
+        },
+        "resultDestination": {
+          "type": "string",
+          "description": "Signed GCS URL where QServ should write the results"
+        },
+        "resultFormat": {
+          "type": "object",
+          "required": ["type", "envelope"],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": ["votable"],
+              "description": "Format of the result file"
+            },
+            "envelope": {
+              "type": "object",
+              "required": ["header", "footer"],
+              "properties": {
+                "header": {
+                  "type": "string",
+                  "description": "VOTable header with metadata structure"
+                },
+                "footer": {
+                  "type": "string",
+                  "description": "VOTable footer to close the XML structure"
+                },
+                "baseUrl": {
+                  "type": "string",
+                  "description": "Base URL to use for access_url fields in results"
+                },
+              }
+            }
+          }
+        },
+        "uploadTable": {
+          "type": "object",
+          "description": "Optional information for TAP_UPLOAD queries",
+          "properties": {
+            "tableName": {
+              "type": "string",
+              "description": "Name to give the uploaded table in QServ"
+            },
+            "sourceUrl": {
+              "type": "string",
+              "description": "GCS URL where the uploaded file was stored by TAP"
+            },
+          }
+        },
+        "timeout": {
+          "type": "integer",
+          "description": "Optional timeout in seconds for query execution"
+        }
+      }
     }
-```
 
-In our case we want to both run the UWS Job delete process which handles the delete process of the UWS job, but also the cancellation of the QServ query.
-This means that we'd probably have to most likely add a new implementation of DatabaseJobPersistence and overwrite the delete method to also call the cancel method of our `QServQueryService`.
-
-Overall, the changes will have an impact on various parts of the the RSP [lsst-tap-service](https://github.com/lsst-sqre/lsst-tap-service) repository  with the Rubin customized version of the CADC TAP software, but it also will potentially require upstream changes to decouple the [dal](https://github.com/opencadc/dal) and [uws](https://github.com/opencadc/uws) query handling code from the use of JDBC. To briefly summarize the main areas that would be impacted:
-
-`QServQueryRunner` Changes:
-
-- Remove JDBC connection management
-- Add new QServService and utilize it here
-- Replace ResultSet handling with ResultData interface or introduce new QServResultSet class which implements ResultSet
-- Add QServ status monitoring for async queries
-- Identify if query is targeted towards TAP_SCHEMA or data and run accordingly.
-
-`TableWriter` Changes:
-
-- Update interfaces to use `ResultData` instead of `ResultSet`
-- Add support for GCS storage integration
-- Modify VOTable generation to work with new result format
-
-Configuration Changes:
-
-- Add HTTP client settings
-- Add QServ API endpoint configuration
-
-
-### 3.4 Result Storage Architecture
-
-The implementation of result storage presents an important architectural decision in terms of how results are communicated between TAP & QServ and here we present two potential approaches.
-
-#### Direct Storage Approach
-
-In this approach, QServ writes query results directly to GCS in VOTable format. Both QServ and the TAP service are configured with knowledge of a predetermined GCS bucket structure and naming conventions. QServ maintains its own GCS credentials for writing results, while the TAP service manages the user interface and result access.
-
-When a query is executed, QServ writes results to a location determined by an agreed-upon naming convention, typically with the use of the query ID. The TAP service, using the same convention, can construct the appropriate GCS URL for redirecting users to their results without requiring explicit communication about storage locations. 
-
-A slight alternative could be that the results endpoint of the QServ HTTP API returns a link to the bucket URL where the results can be fetched from. Which option to go for can be discussed and revisited when the implementation is mature and we have a better idea of the benefits of either.
-
-Generally this approach offers significant advantages for handling large result sizes. By eliminating the need to stream results through the TAP service, it reduces network overhead and system resource usage. 
-If we decide to go with predetermined storage conventions we even further simplify the interaction between services and reduce API complexity, though at the cost of introducing a level of coupling between QServ and TAP. Also, if QServ is able to generate VOTable output, this directly eliminates redundant format conversion steps.
-
-Implementation considerations include establishing robust naming conventions that accommodate all query scenarios, implementing proper error handling in both services and maintaining consistent logging for operational visibility. The system must handle cases such as partial writes, failed transfers, dropped connections and cleanup of temporary results.
-
-
-#### Intermediary Processing Approach
-
-The alternative approach maintains the current model where the TAP service receives results from QServ and manages the storage process. The TAP service would retrieve results via the QServ HTTP API, convert them to VOTable format, and manage the upload to GCS storage. A slight alternative here is that the TAP Service receives the results from the QServ HTTP API in VOTable format rather than JSON so that no conversion is needed on the TAP side.
-
-This approach provides greater control over result formatting and storage but introduces additional overhead in processing large result sets as well as serialization & deserialization overhead in the case where JSON is the only available result output of the QServ API. 
-
-
-#### Average VOTable Size calculation:
-
-To further help the discussion we make few assumptions regarding the average result size described here:
-
-Assumed average column size: 50
-The schema definitions are assumed to occupy around 5-10KB.
-
-Characters:
-Per row: 50 columns × 15 characters ≈ 750 characters
-Total data: 750 characters × 10,000 rows = 7.5 million characters
-
-A breakdown of the total size is thus:
-
-Content: 7MB
-XML Markup overhead ~= 3MB
-Total estimated size: approximately 10MB
-
-This would significantly decrease if results are serialized using base64 encoding.
-
-It is very possible that these are overestimating the expected return size of the queries. However an overestimation here is probably better than underestimating in terms of ensuring a stable system, while at the same time it’s very difficult to calculate what the expected usage will look like. This may be revisited when we have better metrics and statistics.
-
-For the intermediary processing approach where results flow through the TAP service, handling 10MB files would create moderate but manageable load. 
-The primary concern would be concurrent queries, where if multiple users request queries simultaneously, the TAP service would need to process several 10MB streams at once. 
-This could impact service performance and thus requires careful resource management.
-
-However, the direct storage approach becomes even more appealing at this scale. Although 10MB isn't enormous by modern standards, eliminating the need to stream this data through an intermediate service reduces system load and network utilization. When we consider that some queries might return significantly larger results, and that multiple queries might run concurrently, the benefits of using direct storage makes it even more appealing.
-
-
-Note that we should implement appropriate retention policies for these result files, as storing numerous 10MB files could quickly consume significant storage space. For example, if the system processes 1000 queries per day, we'd be generating around 10GB of result data daily. We should establish clear garbage collection policies for these files.
-
-
-
-#### Recommendation
-
-The direct storage approach appears better suited to our goals & requirements. Its key advantage is the boost in performance, through the elimination of double-handling large result sets, which reduces system resource usage and potential bottlenecks and also provides better scalability both in terms of data volume as well as concurrency. 
-Using predetermined storage conventions will also reduce service-to-service communication and simplify the API, though to avoid coupling there is also the option to simply provide links to the result files via the API, both of which seem reasonable options.
-
-We should make sure to have robust error handling and validation in both services to ensure reliable operation and on top of that having comprehensive logging and monitoring will also benefit us in the long term when it comes to visibility into the storage process.
-
-
-
-### 3.5 Error Handling Strategy
-
-Error handling needs to be coordinated across multiple system layers:
-
-QServ API Level:
-
-The QServ service will report errors through HTTP status codes and detailed error messages. For example, when a query fails due to syntax errors:
-
-```
-{
-   "success": 0,
-   "error": "Syntax error in query",
-   "error_ext": {
-       "position": 45,
-       "message": "Unexpected token LIMIT"
-   }
-}
-```
-
-TAP Service Level:
-
-The TAP service will map these errors to appropriate TAP/UWS error states and VOTable error documents. A QServ syntax error would be translated to:
-
-```
-<VOTABLE>
-  <RESOURCE type="results">
-    <INFO name="QUERY_STATUS" value="ERROR">
-      Syntax error at position 45: Unexpected token LIMIT
-    </INFO>
-  </RESOURCE>
-</VOTABLE>
-```
-
-### 3.6 Connection Pool Configuration
-
-The HTTP client should be configured with settings appropriate for the long-running QServ query workloads:
-```
-HttpClient.newBuilder()
-    .connectTimeout(Duration.ofSeconds(10))
-    .pool(
-        maxTotal: 200,          // Maximum concurrent connections
-        maxPerRoute: 20,        // Maximum connections per endpoint
-        validateAfterInactivity: Duration.ofSeconds(30),
-        keepAliveTimeout: Duration.ofSeconds(60)
-    )
-    .build()
-```
-
-These settings should be made configurable through environment variables:
-```
-QSERV_HTTP_MAX_CONNECTIONS=200
-QSERV_HTTP_KEEPALIVE_TIMEOUT=60
-QSERV_HTTP_CONNECTION_TIMEOUT=10
-```
-
-
-### 3.7 Phase Mapping
-
-The TAP service needs to map QServ query states to appropriate UWS execution phases. The mapping ensures consistent status reporting through the TAP interface while accurately reflecting the underlying query state:
-
-| QServ State | UWS Phase   | Description |
-|-------------|-------------|-------------|
-| EXECUTING   | EXECUTING   | Query is actively being processed by QServ workers |
-| COMPLETED   | COMPLETED   | Query has finished successfully and results are available |
-| FAILED      | ERROR      | Query execution failed due to an error |
-| ABORTED     | ABORTED    | Query was explicitly cancelled by user or system |
-
-Additional state transitions that need handling:
-
-- If QServ becomes unavailable during execution, the UWS job should transition to ERROR
-- When QServ reports query exceeds result limit, job transitions to ABORTED
-- If QServ fails to write results to storage, job moves to ERROR
-- Initial query submission failure should leave job as PENDING
-
-The TAP service will monitor these states and update the UWS job accordingly, allowing clients to have clear visibility into query progress and completion status.
-
-
-## 4. Impact Analysis
-
-### 4.1 Performance Implications
-
-#### Network and Processing Impact
-
-The transition from JDBC to HTTP introduces an additional layer of communication between the TAP service and QServ. This could potentially add some latency, but its impact could be minimized through connection pooling and keep-alive connection management. Assuming we go with the approach of QServ writing query results directly to GCS, we eliminate the need to transfer large result sets through the TAP service before moving it to the storage layer. The existing QServ HTTP API returns results in JSON format, which will add serialization/deserialization overhead if used, though this is mitigated if we go with the proposed approach where results are written directly to the result store in a VOTable format.
-
-
-#### Resource Management
-
-The new architecture provides significantly improved visibility into query execution, enabling better resource allocation and usage across the system.
-Providing more detailed and accurate query progress monitoring to users, allows them to make informed decisions about query strategies and the ability to cancel long-running or inefficient queries prevents resource waste.
-
-### 4.2 Operational Changes
-
-#### Monitoring
-
-The QServ HTTP API endpoints could also benefit from monitoring to ensure service health and availability. This includes tracking query progress through chunk completion metrics and maintaining visibility into the distributed query execution process. If we decide to add monitoring capabilities of the QServ API and integrate with existing TAP service monitoring systems we can have a complete view of the service health and better tracing of query execution.
-
-####  Operational Procedures
-
-The transition also potentially updates query management procedures and troubleshooting methods. The direct mapping of UWS query ID (tbd, not jobRef or runID) to QServ query ID provides clear traceability and makes the process of investigating queries and resolving issues easier.
-
-
-### 4.3 Risks and Mitigations
-
-#### Service Availability
-  
-  Risk: HTTP API endpoint becomes unavailable
-  
-  Mitigation: 
-  - Implement robust error handling
-  - Consider fallback options (Could we keep JDBC as a backup option? Would this overly complicate the system?)
-  - Monitor endpoint health
-
-#### Performance Degradation
-  
-  Risk: Unexpected performance issues in production
-  
-  Mitigation:
-  - Comprehensive performance testing before deployment
-  - Ability to revert to JDBC if needed
-
-#### Query Consistency
-  
-  Risk: Differences in query behavior or query results between implementations
-  
-  Mitigation:
-  - Thorough testing of query execution patterns
-  - Validation of result sets including side-by-side comparison of outputs
-  - Clear documentation of any behavioral changes
-
-#### Network Reliability
-
-  Risk: The additional network hop through the HTTP API could introduce reliability issues and additional failure points.
-  
-  Mitigation: 
-  - Implement reliable retry logic with exponential backoff
-  - Add careful monitoring of network latency and error rates between the services
-
-#### Resource Coordination
-
-  Risk: Distributed nature of the system could introduce complexity regarding resource limits & cleanup of results
-  
-  Mitigation: 
-  - Implement clear ownership of resource management
-  - Explicitly develop and document automated cleanup processes & responsibilities.
-
-
-## 5. System Considerations
-
-### 5.1 TAP_SCHEMA queries
-
-In the current setup the TAP_SCHEMA database is not stored in QServ along with the catalogue data, instead it is deployed as a sidecar MySQL container in the RSP cluster. It is also possible that this will move to a CloudSQL database in the future. In any case, if TAP_SCHEMA is not available & queryable under the same QServ API the TAP service will have to identify queries that are targeted towards TAP_SCHEMA and follow the existing JDBC route. This has the potential to introduce complexity to the system, which will require some careful consideration.
-
-### 5.2 Garbage Collection
-
-Assuming we go with the solution where QServ is writing the results to a bucket, the responsibility of managing the bucket and clearing the results during regular intervals will have to belong to the TAP service administrators rather than QServ.
-
-
-### 5.3 Security Considerations
-
-The proposed architecture requires careful management of GCS access permissions across services. In the direct storage approach, QServ needs write access to the results bucket. The TAP service needs read & delete access to manage result retrieval and cleanup of QServ queries, however assuming TAP_SCHEMA is elsewhere and the previous JDBC approach is used for it, we'd need to maintain read & write access for TAP as well.
-
-
-### 5.4 Connection Management
-
-Managing HTTP connections between TAP and QServ requires careful consideration of timeouts, retries, and connection pooling. The system needs to handle long-running queries without exhausting connection resources, while also being able to detect and recover from connection failures. This is particularly important for synchronous queries where client connections must be maintained throughout query execution.
-In the existing JDBC-based approach, the connection pool is primarily managed by Tomcat, whereas moving to an HTTP connection moves the burden on us, which includes properly managing idle connections, timeouts, failed connections, retry logic etc. We'd need to ensure a temporary network issue does not cause the entire query to fail.
-
-
-### 5.5 Query Progress Reporting
-
-The transition to HTTP API enables better query progress monitoring, but we need to consider how to effectively expose this information to users. The UWS job parameters could be extended to include QServ specific progress information like chunk completion status, but this needs to be done in a way that maintains compatibility with standard TAP clients. One possible location for this could be the the uws:result entry, i.e. `<uws:result id="diag" xlink:href="info_here"/>`. At the same time we could utilize the `/quote` UWS endpoint to provide an estimate of execution duration, though it is unclear if there are any clients that properly utilize this.
-
-
-### 5.6 Resource Limits
-The system needs to handle various resource limits consistently:
-
-- QServ query result size limits (What should the result size limit be for a TAP query? How should this be communicated to QServ? Should truncation happen on the QServ side or TAP?)
-- Storage quota management in GCS (Will there be a total quota, and/or user quota? If it is exceeded what should the system behaviour be? How should temporary results be cleared and which service manages this?)
-- Connection pool limits
-- Query concurrency limits
-
-These limits need to be coordinated between QServ and TAP service configurations.
-
-
-### 5.7 Authentication Between Services
-
-One more aspect that needs to be carefully evaluated is the authentication mechanism between TAP and the QServ HTTP API. Currently this is limited to network-level security, where access is restricted to specific subnets. This is slightly limiting especially in terms of the development stages, since it requires running the development version of TAP alongside the same network where QServ resides, which may in some cases not be possible.
-
-Further authentication methods could be considered, with examples being token-based authentication which is used throughout the RSP ecosystem, or basic authentication which would be simpler to implement but would require secure credential management. We should also consider whether the TAP service is the sole client of the API as this may have an effect on which solution best meets the requirements while minimizng effort and complexity.
-
-
+### Job run example event
+
+    {
+      "query": "SELECT TOP 10 * FROM table",
+      "database": "dp1",
+      "jobID": "uws123",
+      "ownerID": "me",
+      "resultDestination": "https://bucket/results_uws123.xml?X-Goog-Signature=a82c76...",
+      "resultFormat": {
+        "type": "votable",
+        "envelope": {
+          "header": "<VOTable xmlns=\"http://www.ivoa.net/xml/VOTable/v1.3\" version=\"1.3\"><RESOURCE type=\"results\"><TABLE><FIELD ID=\"col_0\" arraysize=\"*\" datatype=\"char\" name=\"col1\"/>",
+          "footer": "</TABLE></RESOURCE></VOTable>"
+        }
+      }
+    }
+
+
+## 3.2 Job deletion
+
+### Job delete Topic Schema
+
+    {
+      "type": "object",
+      "required": ["qservID"],
+      "properties": {
+        "qservID": {
+          "type": "string",
+          "description": "QServ query ID"
+        },
+        "ownerID": {
+          "type": "string",
+          "description": "ID of user who submitted the delete request"
+        },
+      }
+    }
+
+### Example job delete event
+
+    {
+      "qservID": "qserv-123",
+      "ownerID": "me"
+    }
+
+
+## 3.3 Job status
+
+### Job status Topic Schema
+    
+    {
+      "type": "object",
+      "required": ["jobID", "timestamp", "status"],
+      "properties": {
+        "jobID": {
+          "type": "string",
+          "description": "UWS job ID"
+        },
+        "qservID": {
+          "type": "string",
+          "description": "QServ query ID"
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Time of this status update"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["QUEUED", "EXECUTING", "COMPLETED", "ERROR", "ABORTED", "DELETED"],
+          "description": "Current status of the job"
+        },
+        "queryInfo": {
+          "type": "object",
+          "description": "Info about query execution",
+          "properties": {
+            "startTime": {
+              "type": "string",
+              "format": "date-time",
+              "description": "Time when query execution started"
+            },
+            "endTime": {
+              "type": "string",
+              "format": "date-time",
+              "description": "Time when query execution completed"
+            },
+            "duration": {
+              "type": "integer",
+              "description": "Duration of execution in seconds"
+            },
+            "totalChunks": {
+              "type": "integer",
+              "description": "Total number of QServ chunks to process"
+            },
+            "completedChunks": {
+              "type": "integer",
+              "description": "Number of chunks processed so far"
+            },
+            "estimatedTimeRemaining": {
+              "type": "integer",
+              "description": "Estimated seconds remaining to completion"
+            }
+          }
+        },
+        "resultInfo": {
+          "type": "object",
+          "description": "Information about query results",
+          "properties": {
+            "totalRows": {
+              "type": "integer",
+              "description": "Total number of rows in the result"
+            },
+            "resultLocation": {
+              "type": "string",
+              "description": "GCS URL where results were written"
+            },
+            "format": {
+              "type": "string",
+              "enum": ["votable"],
+              "description": "Format of the result file"
+            },
+          }
+        },
+        "errorInfo": {
+          "type": "object",
+          "description": "Information about any errors that occurred",
+          "properties": {
+            "errorCode": {
+              "type": "string",
+              "description": "Error code, if applicable"
+            },
+            "errorMessage": {
+              "type": "string",
+              "description": "Human-readable error message"
+            },
+            "stackTrace": {
+              "type": "string",
+              "description": "Optional stack trace for debugging"
+            }
+          }
+        },
+        "metadata": {
+          "type": "object",
+          "description": "Additional metadata about the query",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "The original query"
+            },
+            "database": {
+              "type": "string",
+              "description": "Database that was queried"
+            },
+            "userTables": {
+              "type": "array",
+              "description": "List of any user tables created for TAP_UPLOAD",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    }
+
+
+### Job status for completed query example
+
+    {
+      "jobID": "uws-123",
+      "qservID": "qserv-123",
+      "timestamp": "2025-03-19T..",
+      "status": "COMPLETED",
+      "queryInfo": {
+        "startTime": "2025-03-18T..",
+        "endTime": "2025-03-19T..",
+        "duration": 214,
+        "totalChunks": 167,
+        "completedChunks": 167
+      },
+      "resultInfo": {
+        "totalRows": 1000,
+        "resultLocation": "https://bucket/results_uws123.xml",
+        "format": "votable",
+        "sizeBytes": 128456
+      },
+      "metadata": {
+        "query": "SELECT TOP 10 * FROM table",
+        "database": "dp1"
+      }
+    }
+
+### Job status with error
+
+    {
+      "jobID": "uws-123",
+      "qservID": "qserv-123",
+      "timestamp": "2025-03-19T..",
+      "status": "ERROR",
+      "queryInfo": {
+        "startTime": "2025-03-19T..",
+        "endTime": "2025-03-19T..",
+        "duration": 3,
+        "totalChunks": 3,
+        "completedChunks": 1
+      },
+      "errorInfo": {
+        "errorCode": "QSERR-1",
+        "errorMessage": "Syntax Error at line 1",
+        "stackTrace": "at QservQueryExecutor.executeQuery..."
+      },
+      "metadata": {
+        "query": "SELECT TOP 10 * FROM dp1.Table",
+        "database": "dp1",
+        "userTables": ["my_objects"]
+      }
+    }
+
+## 4. Kafka Topics Structure
+
+- run_query - Requests to start a query from TAP service towards QServ
+- delete_query - Requests to stop & delete a query from TAP service towards QServ
+- job_status - Update to job status from QServ towards TAP service 
+
+
+## 5. Potential Challenges and Considerations
+
+
+### How do we handle ObsCore queries that return datalinks?
+
+Currently for obscore queries that return datalinks, the TAP Service will 
+overwrite the obdscore access_url value with the base URL of the TAP service, available to the TAP Service as an 
+env variable.
+
+However, in the new architecture, QServ will be writing the results to GCS, 
+without the results going through TAP, so we need to figure out a way to 
+provide the base URL to QServ so that it can use this in the access_url field of the VOTable.
+
+In the proposal here, we include the base URL in the metadata provided in the run_query event, 
+which QServ can then use to construct the access_url field in the VOTable.
+
+### Should QServ be aware of the UWS job? 
+
+Should we be passing the uws jobID to it, or is the job identification done purely via the qserv query ID? 
+We will have both a qservID and uws jobID in our table, but in the case we use the qserv query ID for this it needs to be indexed.
+
+### How do we handle timeouts?
+
+What happens if Qserv goes down after having picked an event of the queue, and thus is never able to complete the query, in which case we never get a job status update for that query, leading to the case where the job is stuck as “RUNNING” infinitely.
+We need an approach to catch these cases, a few options to consider:
+A batch job which checks if jobs have exceeded a given timeout. If so, update it (Perhaps setting it to FAILED?)
+Upon a user checking the status of a job, we check the duration and time it 
+out if it has exceeded our timeout.
+
+### What happens if QServ is down for a long period? 
+
+The event queue would continue to fill up with query events. Once QServ is 
+back up and running, we need to decide if we start from the last offset, i.e. 
+run all queries that were added to the queue, or if we want to have it auto-reset to the latest event. The potential issue with the first approach, is that if the queue grows quite a bit until QServ recovers, it may take a long time to process all events until it is able to start processing the newest ones. From the user’s point of view newer queries will be stuck as HELD for a while, while on the other hand, in all likelihood users would not be actively polling older jobs if they haven’t returned within a reasonable amount of time.
+
+### Authentication
+
+Qserv is at USDF so we need to figure out the best authentication story here so that Kafka consumer/producer can interact with the cloud idfs. 
+This includes egress traffic from USDF to the cloud, and also ingress traffic from the cloud to USDF.
+
+### Authorization for query deletion
+
+In theory a user can request any job be deleted via it's UWS ID, not 
+limited to their own jobs.
+This should not be allowed, which means either the TAP service needs to
+check that the user is the owner of the job before sending the delete
+event, or QServ needs to check this before deleting the job.
+Probably the best approach is to have the TAP service to do this check.
+
+## 6. QServ Change Requirements
+
+### 6.1 Add Kafka consumer and Producer
+
+Add a Kafka consumer in the QServ app which will read from the run_query, 
+delete_query topics and act on the messages received.
+
+Add a Kafka producer in QServ which will send out events for job_status updates, including:
+- Job is running
+- Job has completed, either successfully or with failure
+
+
+### 6.2 Result Writing Mechanism
+
+Implement functionality to:
+Write query results directly to GCS using the provided signed URL
+
+### 6.3 Result Format
+
+Generate a VOTable for the results. Ideally use the BINARY2 table serialization
+The VOTable header/footer will be provided in the initial query request.
+
+### 6.4 (Optional) Correlate UWS job ID with QServ ID
+
+This is an optional requirement, but it would be useful to have a way to correlate the UWS jobID with the QServ queryID.
+
+The metadata provided in the create query event will include the uws jobID. 
+If this jobID can then be included in the outgoing event from QServ, then we can use this in the process of syncing this event to the UWS database, which uses the jobID as a pkey.
+
+If this is not possible we’ll have to use qservID as the key.
+
+### 6.5 Authentication and Security
+
+#### Writing to GCS:
+
+Qserv should be able to write results to GCS using signed URLs. 
+Also, we need to ensure that the Kafka producer and consumer can interact 
+with the cloud idfs.
+
+### 6.6 Failed queries
+
+Failed synchronous queries need to be written out as proper VOTable results with error status and messages contained as per the IVOA spec.
+In this design, probably the best way to handle this is to have QServ 
+include any error messages in the job_status event, and then have the TAP 
+service update the UWS job with this error message. In the case of a 
+synchronous query the TAP service will then have to generate the VOTable 
+which will contain this error message it got from the job_status event.
+
+### 6.7 Datalink access_urls
+
+As mentioned above, we need to figure out a way to provide the base URL to QServ 
+so that it can use this in the access_url field of the VOTable. This 
+implies some additional logic in QServ to know when to format the results of a
+query and overwrite the access_url field with the base URL provided.
+
+A simple approach would be that when QServ receives a run_query event that 
+contains a base URL, it will use this base URL to overwrite the access_url. 
+
+In other words the TAP service already knows that it wants the results 
+formatted to replace the base_url, so QServ does not have to make that 
+decision, instead simply identify the access_url.
+
+A slight alternative could be to be more explicit and add metadata in the event
+to indicate the field name to format, and how to format the row values.
+
+
+
+## 7. TAP Service Change Requirements
+
+### TAP Kafka Consumer
+
+A Kafka consumer which listens to job_status topics and updates the UWS database accordingly.
+
+### TAP Kafka Producer
+
+A Kafka producer which sends events to various topics (run query, delete query).
+
+### TAP_SCHEMA vs QServ Queries
+
+The TAP service will need to diffentiate between TAP_SCHEMA queries and 
+QServ queries, with tap_schema queries being executed via JDBC.
+
+### QueryRunner
+
+The above will probably require generic QueryRunner and JobExecutor interfaces that define the interfaces required for us to submit queries via a Kafka producer.
+
+### Synchronous Queries
+
+Depending on which implementation we choose, we may have to customize the QueryRunner to run sync over async, and then introduce a synchronization mechanism like the Semaphore described. These are probably specific to our use case, but perhaps the interfaces can be such to allow this to be done via custom implementations.
+
+### Job Cancellation
+
+Cancellation of jobs will involve using our Kafka plugin to generate a delete event and send it via the TAP Kafka producer to Qserv, then updating the UWS job to set the appropriate flags/fields in UWS.
+
+### TAP Upload
+
+The TAP_UPLOAD process will require the TAP service to push the file to GCS and then send the GCS URL along with the file name to the QServ Kafka producer.
+
+### Storing job results endpoint in UWS
+
+The TAP Service needs to read the results URL from a completed jobs and 
+store it in UWS. However, we use a redirect servlet to serve the results,
+so we need to store the redirect URL in UWS, not the GCS URL.
