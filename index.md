@@ -213,8 +213,13 @@ the file into QServ.
 
     {
       "type": "object",
-      "required": ["query", "jobID", "ownerID", "resultDestination", "resultFormat"],
+      "required": ["query", "jobID", "ownerID", "resultDestination", "resultFormat", "schemaVersion"],
       "properties": {
+        "schemaVersion": {
+          "type": "string",
+          "description": "Version of the schema",
+          "default": "1.0"
+        },
         "query": {
           "type": "string",
           "description": "The SQL query to be executed by QServ"
@@ -288,6 +293,7 @@ the file into QServ.
 ### Job run example event
 
     {
+      "schemaVersion": "1.0",
       "query": "SELECT TOP 10 * FROM table",
       "database": "dp1",
       "jobID": "uws123",
@@ -309,8 +315,13 @@ the file into QServ.
 
     {
       "type": "object",
-      "required": ["qservID"],
+      "required": ["qservID", "schemaVersion"],
       "properties": {
+        "schemaVersion": {
+          "type": "string",
+          "description": "Version of the schema",
+          "default": "1.0"
+        },
         "qservID": {
           "type": "string",
           "description": "QServ query ID"
@@ -325,6 +336,7 @@ the file into QServ.
 ### Example job delete event
 
     {
+      "schemaVersion": "1.0",
       "qservID": "qserv-123",
       "ownerID": "me"
     }
@@ -333,11 +345,16 @@ the file into QServ.
 ## 3.3 Job status
 
 ### Job status Topic Schema
-    
+
     {
       "type": "object",
-      "required": ["jobID", "timestamp", "status"],
+      "required": ["jobID", "timestamp", "status", "schemaVersion"],
       "properties": {
+        "schemaVersion": {
+          "type": "string",
+          "description": "Version of the schema",
+          "default": "1.0"
+        },
         "jobID": {
           "type": "string",
           "description": "UWS job ID"
@@ -453,6 +470,7 @@ the file into QServ.
 ### Job status for completed query example
 
     {
+      "schemaVersion": "1.0",
       "jobID": "uws-123",
       "qservID": "qserv-123",
       "timestamp": "2025-03-19T..",
@@ -479,6 +497,7 @@ the file into QServ.
 ### Job status with error
 
     {
+      "schemaVersion": "1.0",
       "jobID": "uws-123",
       "qservID": "qserv-123",
       "timestamp": "2025-03-19T..",
