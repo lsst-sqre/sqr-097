@@ -6,7 +6,7 @@ The current setup lacks crucial query control capabilities - specifically, the a
 We propose a new event-based architecture that decouples the TAP service from 
 QServ. This architecture utilizes Kafka queues as the means for messaging 
 between TAP and QServ, with a plan to take advantage of existing systems 
-and knowledge (Sasquatch, Strimzi), to enable asynchronous query execution 
+and knowledge, in particular, Apache Kafka managed by Sasquatch to enable asynchronous query execution 
 with capabilities for query cancellation and monitoring.
 ```
 
@@ -64,6 +64,7 @@ System Architecture
 ```
 
 ### Core Components
+
 - TAP Service: CADC TAP service
 - UWS Database: Stores job information and status
 - QServ: Distributed database with HTTP REST API for query execution
@@ -71,6 +72,7 @@ System Architecture
 - Google Cloud Storage (GCS): Store Query VOTable results
 
 ### Key Technical Elements
+- 
 - Job ID Correlation: We’ll maintain a mapping between uws jobID and qservID
 This may be done as an additional field in the UWS table (qservID)
 - Signed URLs: We may be able to use signed URLs as a means for QServ to write to GCS without credential management
@@ -94,26 +96,40 @@ This may be done as an additional field in the UWS table (qservID)
 - TAP service performs query validation, transformation to QServ SQL, and 
   extracts select list with metadata and generates the VOTable envelope
 - (Optional) TAP service updates the status of the job to QUEUED
-- TAP service publishes a message to the run_query Kafka topic
+- TAP service publishes a message to the lsst.tap.job-run Kafka topic
 - Nothing else required at this point from the TAP Service.
 
 #### QServ:
 
-- QServ pulls an event from run_query Kafka queue
-- QServ sends out a job_status update event with status = EXECUTING 
+- QServ pulls an event from lsst.tap.job-run Kafka queue
+- QServ sends out a lsst.tap.job-status update event with status = EXECUTING 
   and begins the query execution
+- While executing the query, QServ sends out lsst.tap.job-status events with 
+  progress information, such as the number of chunks processed, 
+  estimated time remaining, etc. The interval of these updates is TBD, but
+  perhaps every 20% of the total chunks processed would be a good starting 
+  point.
 - Upon completion, it serializes the results as a VOTable (XML), using the VOTable envelope provided, ideally using BINARY2 serialization.
 - QServ writes the results to the GCS bucket, using the signed URL provided
-- Upon successful writing, it sends out an event to the job_status with the 
+- Upon successful writing, it sends out an event to the lsst.tap.job-status with the 
   status of the job (COMPLETED / FAILED / ABORTED).
 
 #### TAP Service:
 
-- TAP Service pulls events from job_status.
+- TAP Service pulls events from lsst.tap.job-status.
 - It then updates the UWS database with the metadata provided in that event.
 - Events in this case may indicate a Completed job, a job that failed along with metadata on reasons for the failure, or a status of RUNNING to indicate that the job is now executing. 
-We may also choose to include progress information here which is available in QServ, like how many chunks out of the total have completed. 
-This can then be added to the jobdetail UWS table and become available via the UWS job endpoint.
+
+One of the benefits of the new architectue is that it allows us to provide 
+progress information to the user. The initial proposal here is to store this
+information in the jobdetail UWS table, with each update event appending a 
+new row to that table.
+
+If we find that this is producing too much data, we may also consider
+introducing a new field in the UWS job table to store the progress information,
+though this would probably be an implementation-specific defail which would not
+end up as part of the upstream CADC codebase.
+
  
 #### Result Retrieval Flow
 
@@ -163,47 +179,39 @@ before deciding if we need to move to a more complex solution.
     
 #### TAP Service:
 
-- Upon receiving a request to delete a job send an event to the delete_query 
+- Upon receiving a request to delete a job send an event to the lsst.tap.job-delete 
 topic
 - Update the status of the UWS job to set it to DELETED
 
 #### QServ:
 
 - Upon receiving a request to delete a job, stop and delete query
+Our approach here would be to set the job to DELETED in UWS before sending off the event in Kafka. This ensures that the job is marked as deleted, in case the user checks the status before the event is processed by QServ.
 
 
-A detail here to be ironed out is whether we should set the job to DELETED in UWS regardless of what happens on the 
-QServ side, or if we instead add another interaction step where we wait for 
-a job status update from QServ which will then set the job to DELETED.
+#### Temporary Upload Data Flow
 
-If we go with the second approach, we may run into the following scenario:
-- User asks to delete a job.
-- User asks to see this job, which has a status of COMPLETED instead of 
-  DELETED.
-
-Therefore, it probably makes to go with the first approach and set the job to DELETED in UWS regardless of what happens on the QServ side.
-
-
-#### TAP Upload Data Flow
-
-The TAP Upload process will look something like this:
+The temporary TAP Upload process will look something like this:
 
 #### TAP Service:
+
 - Upon receiving a request to do a TAP_UPLOAD query, we take the uploaded file 
   and push it to GCS. 
-- Send the GCS URL along with a name for the file to the upload_table topic 
-  as additional metadata in the run_query event.
+- Send the GCS URL along with a name for the file as additional metadata in the lsst.tap.job-run event.
 
 #### QServ:
 
 - Upon receiving a request to upload a user table, use the GCS URL to upload 
 the file into QServ.
 - Once table has been uploaded, initialize the query and send a topic to 
-  job_status with status = EXECUTING
-- Upon completion, send an event to the job_status topic with the status of 
+  lsst.tap.job-status with status = EXECUTING
+- Upon completion, send an event to the lsst.tap.job-status topic with the status of 
   the job (COMPLETED / FAILED / ABORTED).
 - Delete table from QServ
 
+This is a preliminary design for the temporary TAP upload which requires 
+some more considerations and may be changed in the future as we get 
+further into the implementation.
 
 ## 3.  Event Schemas
 
@@ -213,13 +221,8 @@ the file into QServ.
 
     {
       "type": "object",
-      "required": ["query", "jobID", "ownerID", "resultDestination", "resultFormat", "schemaVersion"],
+      "required": ["query", "jobID", "ownerID", "resultDestination", "resultFormat"],
       "properties": {
-        "schemaVersion": {
-          "type": "string",
-          "description": "Version of the schema",
-          "default": "1.0"
-        },
         "query": {
           "type": "string",
           "description": "The SQL query to be executed by QServ"
@@ -293,7 +296,6 @@ the file into QServ.
 ### Job run example event
 
     {
-      "schemaVersion": "1.0",
       "query": "SELECT TOP 10 * FROM table",
       "database": "dp1",
       "jobID": "uws123",
@@ -315,13 +317,8 @@ the file into QServ.
 
     {
       "type": "object",
-      "required": ["qservID", "schemaVersion"],
+      "required": ["qservID"],
       "properties": {
-        "schemaVersion": {
-          "type": "string",
-          "description": "Version of the schema",
-          "default": "1.0"
-        },
         "qservID": {
           "type": "string",
           "description": "QServ query ID"
@@ -336,7 +333,6 @@ the file into QServ.
 ### Example job delete event
 
     {
-      "schemaVersion": "1.0",
       "qservID": "qserv-123",
       "ownerID": "me"
     }
@@ -348,13 +344,8 @@ the file into QServ.
 
     {
       "type": "object",
-      "required": ["jobID", "timestamp", "status", "schemaVersion"],
+      "required": ["jobID", "timestamp", "status"],
       "properties": {
-        "schemaVersion": {
-          "type": "string",
-          "description": "Version of the schema",
-          "default": "1.0"
-        },
         "jobID": {
           "type": "string",
           "description": "UWS job ID"
@@ -470,7 +461,6 @@ the file into QServ.
 ### Job status for completed query example
 
     {
-      "schemaVersion": "1.0",
       "jobID": "uws-123",
       "qservID": "qserv-123",
       "timestamp": "2025-03-19T..",
@@ -497,7 +487,6 @@ the file into QServ.
 ### Job status with error
 
     {
-      "schemaVersion": "1.0",
       "jobID": "uws-123",
       "qservID": "qserv-123",
       "timestamp": "2025-03-19T..",
@@ -521,14 +510,37 @@ the file into QServ.
       }
     }
 
-## 4. Kafka Topics Structure
+## Result Format & Serialization
 
-- run_query - Requests to start a query from TAP service towards QServ
-- delete_query - Requests to stop & delete a query from TAP service towards QServ
-- job_status - Update to job status from QServ towards TAP service 
+There are three possible formats that we are considering for the results:
+
+- VOTable with TABLEDATA serialization
+- VOTable with BINARY2 serialization (https://www.ivoa.net/documents/VOTable/20241125/PR-VOTable-1.5-20241125.html#tth_sEc5.4)
+- VOTable-in-parquet https://wiki.ivoa.net/twiki/bin/viewfile/IVOA/InterOpNov2024Apps?filename=votparquet.pdf;rev=1)
+
+The selection is primarily driven by compatibility with the main data 
+consumers, pyvo and Firefly, along with performance optimization 
+considerations.
+
+TABLEDATA serialization will be the simplest to implement, but it is also
+the least efficient in terms of data transfer. BINARY2 serialization is
+more efficient, but it is also more complex to implement. VOTable-in-parquet
+is the most efficient, but it is work in progress and may not be ready for
+DP1.
+
+The proposal for this technote is to aim to implement BINARY2 serialization
+for the initial implementation, with a backup plan to use TABLEDATA if
+BINARY2 is not feasible, and a longer-term goal of moving to VOTable-in-parquet
+once it is ready.
+
+## 5. Kafka Topics Structure
+
+- lsst.tap.job-run - Requests to start a query from TAP service towards QServ
+- lsst.tap.job-delete - Requests to stop & delete a query from TAP service towards QServ
+- lsst.tap.job-status - Update to job status from QServ towards TAP service 
 
 
-## 5. Potential Challenges and Considerations
+## 6. Potential Challenges and Considerations
 
 
 ### How do we handle ObsCore queries that return datalinks?
@@ -541,7 +553,7 @@ However, in the new architecture, QServ will be writing the results to GCS,
 without the results going through TAP, so we need to figure out a way to 
 provide the base URL to QServ so that it can use this in the access_url field of the VOTable.
 
-In the proposal here, we include the base URL in the metadata provided in the run_query event, 
+In the proposal here, we include the base URL in the metadata provided in the lsst.tap.job-run event, 
 which QServ can then use to construct the access_url field in the VOTable.
 
 ### Should QServ be aware of the UWS job? 
@@ -577,38 +589,43 @@ check that the user is the owner of the job before sending the delete
 event, or QServ needs to check this before deleting the job.
 Probably the best approach is to have the TAP service to do this check.
 
-## 6. QServ Change Requirements
+## 7. QServ Change Requirements
 
-### 6.1 Add Kafka consumer and Producer
+### Add Kafka consumer and Producer
 
-Add a Kafka consumer in the QServ app which will read from the run_query, 
-delete_query topics and act on the messages received.
+Add a Kafka consumer in the QServ app which will read from the lsst.tap.job-run, 
+lsst.tap.job-delete topics and act on the messages received.
 
-Add a Kafka producer in QServ which will send out events for job_status updates, including:
+Add a Kafka producer in QServ which will send out events for lsst.tap.job-status updates, including:
 - Job is running
 - Job has completed, either successfully or with failure
 
 
-### 6.2 Result Writing Mechanism
+### Result Writing Mechanism
 
 Implement functionality to:
 Write query results directly to GCS using the provided signed URL
 
-### 6.3 Result Format
+### Result Format
 
 Generate a VOTable for the results. Ideally use the BINARY2 table serialization
 The VOTable header/footer will be provided in the initial query request.
 
-### 6.4 (Optional) Correlate UWS job ID with QServ ID
+### Correlate UWS job ID with QServ ID
 
-This is an optional requirement, but it would be useful to have a way to correlate the UWS jobID with the QServ queryID.
+Upon TAP sending a job-run event, QServ will need to either:
 
-The metadata provided in the create query event will include the uws jobID. 
-If this jobID can then be included in the outgoing event from QServ, then we can use this in the process of syncing this event to the UWS database, which uses the jobID as a pkey.
+a) Store the mapping between UWS jobID and QServ queryID
+b) Take the uws jobID that was provided in the event, and send it as part of
+the job-status event, so that the TAP service can correlate the two.
 
-If this is not possible we’ll have to use qservID as the key.
+Ideally, if it can be passed along with every job status event, the TAP
+can use that to update the UWS job status. Otherwise, we can also use 
+qservID as the key (assuming we have indexed it as a new field in the UWS 
+job table), however the initial correlation still needs to happen, so the 
+initial job-run event would have to contain the uws jobID.
 
-### 6.5 Authentication and Security
+### Authentication and Security
 
 #### Writing to GCS:
 
@@ -616,23 +633,23 @@ Qserv should be able to write results to GCS using signed URLs.
 Also, we need to ensure that the Kafka producer and consumer can interact 
 with the cloud idfs.
 
-### 6.6 Failed queries
+### Failed queries
 
 Failed synchronous queries need to be written out as proper VOTable results with error status and messages contained as per the IVOA spec.
 In this design, probably the best way to handle this is to have QServ 
-include any error messages in the job_status event, and then have the TAP 
+include any error messages in the lsst.tap.job-status event, and then have the TAP 
 service update the UWS job with this error message. In the case of a 
 synchronous query the TAP service will then have to generate the VOTable 
-which will contain this error message it got from the job_status event.
+which will contain this error message it got from the lsst.tap.job-status event.
 
-### 6.7 Datalink access_urls
+### Datalink access_urls
 
 As mentioned above, we need to figure out a way to provide the base URL to QServ 
 so that it can use this in the access_url field of the VOTable. This 
 implies some additional logic in QServ to know when to format the results of a
 query and overwrite the access_url field with the base URL provided.
 
-A simple approach would be that when QServ receives a run_query event that 
+A simple approach would be that when QServ receives a lsst.tap.job-run event that 
 contains a base URL, it will use this base URL to overwrite the access_url. 
 
 In other words the TAP service already knows that it wants the results 
@@ -644,11 +661,11 @@ to indicate the field name to format, and how to format the row values.
 
 
 
-## 7. TAP Service Change Requirements
+## 8. TAP Service Change Requirements
 
 ### TAP Kafka Consumer
 
-A Kafka consumer which listens to job_status topics and updates the UWS database accordingly.
+A Kafka consumer which listens to lsst.tap.job-status topics and updates the UWS database accordingly.
 
 ### TAP Kafka Producer
 
@@ -680,3 +697,19 @@ The TAP_UPLOAD process will require the TAP service to push the file to GCS and 
 The TAP Service needs to read the results URL from a completed jobs and 
 store it in UWS. However, we use a redirect servlet to serve the results,
 so we need to store the redirect URL in UWS, not the GCS URL.
+
+
+## 9. Batch maintenance job to clean up old & jobs that have timed out
+
+We need to have a batch job that runs periodically to clean up old jobs that have been completed, and also jobs that have timed out.
+This may occur in situations where QServ goes down and is unable to send a 
+job status update, or if the job is stuck in a running state for an extended period.
+
+To address this we could have a batch job that runs periodically to check the
+status of jobs that have been running for an extended period, and if they have
+exceeded a certain timeout, mark them as failed. The timeout would be set to 
+a value close and above what the QServ query timeout is set to.
+
+We could also potentially utilize the QServ REST HTTP API which has a status
+endpoint to check the status of a query. This would allow us to check the
+actual status of the job before marking it as failed.
