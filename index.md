@@ -69,6 +69,7 @@ System Architecture
 - UWS Database: Stores job information and status
 - QServ: Distributed database with HTTP REST API for query execution
 - Kafka (Sasquatch): Event streaming platform
+- QServ adapter: Will read from Kafka and interact with QServ via existing async and HTTP APIs
 - Google Cloud Storage (GCS): Store Query VOTable results
 
 ### Key Technical Elements
@@ -99,18 +100,20 @@ This may be done as an additional field in the UWS table (qservID)
 - TAP service publishes a message to the lsst.tap.job-run Kafka topic
 - Nothing else required at this point from the TAP Service.
 
-#### QServ:
+#### QServ (Adapter & Czar):
 
-- QServ pulls an event from lsst.tap.job-run Kafka queue
-- QServ sends out a lsst.tap.job-status update event with status = EXECUTING 
-  and begins the query execution
-- While executing the query, QServ sends out lsst.tap.job-status events with 
+- QServ adapter pulls an event from lsst.tap.job-run Kafka queue
+- QServ adapter sends out a lsst.tap.job-status update event with status = EXECUTING 
+  and sends it to the QServ Czar, it then stores the qservID.
+- Qserv Czar begins the query execution
+- While executing the query, QServ adapter sends out lsst.tap.job-status events with 
   progress information, such as the number of chunks processed, 
   estimated time remaining, etc. The interval of these updates is TBD, but
   perhaps every 20% of the total chunks processed would be a good starting 
-  point.
-- Upon completion, it serializes the results as a VOTable (XML), using the VOTable envelope provided, ideally using BINARY2 serialization.
-- QServ writes the results to the GCS bucket, using the signed URL provided
+  point. To get this information it can use either the SQL async interface or the HTTP API.
+- Qserv Adapter polls Qserv for status checks for job.
+- Upon completion, Qserv Adapter uses the SQL interface to fetch results and stream them into GCS, using the VOTable envelope provided, ideally using BINARY2 serialization.
+- QServ adapter writes the results to the GCS bucket, using the signed URL provided
 - Upon successful writing, it sends out an event to the lsst.tap.job-status with the 
   status of the job (COMPLETED / FAILED / ABORTED).
 
@@ -183,9 +186,11 @@ before deciding if we need to move to a more complex solution.
 topic
 - Update the status of the UWS job to set it to DELETED
 
-#### QServ:
+#### QServ adapter:
 
-- Upon receiving a request to delete a job, stop and delete query
+- Qserv pulls event form job-delete queue.
+- Upon receiving a request to delete a job, sends a request to either API of QServ to stop and delete query.
+
 Our approach here would be to set the job to DELETED in UWS before sending off the event in Kafka. This ensures that the job is marked as deleted, in case the user checks the status before the event is processed by QServ.
 
 
@@ -199,15 +204,14 @@ The temporary TAP Upload process will look something like this:
   and push it to GCS. 
 - Send the GCS URL along with a name for the file as additional metadata in the lsst.tap.job-run event.
 
-#### QServ:
+#### QServ adapter:
 
-- Upon receiving a request to upload a user table, use the GCS URL to upload 
-the file into QServ.
-- Once table has been uploaded, initialize the query and send a topic to 
-  lsst.tap.job-status with status = EXECUTING
+- Upon receiving a job-run request which includes a temporary table upload upload, se the GCS URL to upload 
+the file into QServ via the HTTP API.
+- Once table has been uploaded, initialize the query via either QServ API and send an event to job_status that the job is EXECUTING.
 - Upon completion, send an event to the lsst.tap.job-status topic with the status of 
   the job (COMPLETED / FAILED / ABORTED).
-- Delete table from QServ
+- Delete table from QServ via the HTTP API of QServ
 
 This is a preliminary design for the temporary TAP upload which requires 
 some more considerations and may be changed in the future as we get 
@@ -243,35 +247,77 @@ further into the implementation.
           "type": "string",
           "description": "Signed GCS URL where QServ should write the results"
         },
-        "resultFormat": {
-          "type": "object",
-          "required": ["type", "envelope"],
-          "properties": {
-            "type": {
-              "type": "string",
-              "enum": ["votable"],
-              "description": "Format of the result file"
-            },
-            "envelope": {
-              "type": "object",
-              "required": ["header", "footer"],
-              "properties": {
-                "header": {
-                  "type": "string",
-                  "description": "VOTable header with metadata structure"
-                },
-                "footer": {
-                  "type": "string",
-                  "description": "VOTable footer to close the XML structure"
-                },
-                "baseUrl": {
-                  "type": "string",
-                  "description": "Base URL to use for access_url fields in results"
-                },
-              }
-            }
-          }
-        },
+        "resultLocation": {
+	  "type": "string",
+	  "description": "Optional result location for tracking purposes",
+	},
+	"resultFormat": {
+	  "type": "object",
+	  "required": ["format", "envelope", "columnTypes"],
+	  "properties": {
+	    "format": {
+	      "type": "object",
+	      "required": ["type", "serialization"],
+	      "properties": {
+		"type": {
+		  "type": "string",
+		  "enum": ["votable"],
+		  "description": "Base format type of the result file"
+		},
+		"serialization": {
+		  "type": "string",
+		  "enum": ["tabledata", "binary2"],
+		  "description": "Serialization method used for the format"
+		}
+	      }
+	    },
+	    "envelope": {
+	      "type": "object",
+	      "required": ["header", "footer"],
+	      "properties": {
+		"header": {
+		  "type": "string",
+		  "description": "VOTable header with metadata structure"
+		},
+		"footer": {
+		  "type": "string",
+		  "description": "VOTable footer to close the XML structure"
+		}
+	      }
+	    },
+	    "columnTypes": {
+	      "type": "array",
+	      "description": "Array of column type information",
+	      "items": {
+		"type": "object",
+		"required": ["name", "datatype"],
+		"properties": {
+		  "name": {
+		    "type": "string",
+		    "description": "Column name"
+		  },
+		  "datatype": {
+		    "type": "string",
+		    "description": "VOTable datatype"
+		  },
+		  "arraysize": {
+		    "type": "string",
+		    "description": "Optional array size specification for the column"
+		  },
+		  "requiresUrlRewrite": {
+		    "type": "boolean",
+		    "description": "Flag indicating if this column needs URL rewriting",
+		    "default": false
+		  }
+		}
+	      }
+	    },
+	    "baseUrl": {
+	      "type": "string",
+	      "description": "Base URL to use for access_url fields that require rewriting"
+	    }
+	  }
+	},
         "uploadTable": {
           "type": "object",
           "description": "Optional information for TAP_UPLOAD queries",
@@ -283,7 +329,7 @@ further into the implementation.
             "sourceUrl": {
               "type": "string",
               "description": "GCS URL where the uploaded file was stored by TAP"
-            },
+            }
           }
         },
         "timeout": {
@@ -301,14 +347,41 @@ further into the implementation.
       "jobID": "uws123",
       "ownerID": "me",
       "resultDestination": "https://bucket/results_uws123.xml?X-Goog-Signature=a82c76...",
+      "resultLocation": "https://bucket/results_uws123.xml",
       "resultFormat": {
-        "type": "votable",
+        "format": {
+          "type": "votable",
+          "serialization": "binary2"
+        },
         "envelope": {
           "header": "<VOTable xmlns=\"http://www.ivoa.net/xml/VOTable/v1.3\" version=\"1.3\"><RESOURCE type=\"results\"><TABLE><FIELD ID=\"col_0\" arraysize=\"*\" datatype=\"char\" name=\"col1\"/>",
           "footer": "</TABLE></RESOURCE></VOTable>"
+        },
+        "columnTypes": [
+          {
+            "name": "object_id",
+            "datatype": "long"
+          },
+          {
+            "name": "ra",
+            "datatype": "double"
+          },
+          {
+            "name": "dec",
+            "datatype": "double"
+          },
+          {
+            "name": "access_url",
+            "datatype": "char",
+            "arraysize": "*",
+            "requiresUrlRewrite": true
+          }
+        ],
+        "baseUrl": "https://data-dev.lsst.cloud/"
         }
       }
-    }
+
+
 
 
 ## 3.2 Job deletion
@@ -317,11 +390,11 @@ further into the implementation.
 
     {
       "type": "object",
-      "required": ["qservID"],
+      "required": ["executionID"],
       "properties": {
-        "qservID": {
+        "executionID": {
           "type": "string",
-          "description": "QServ query ID"
+          "description": "Internal ID of the job being executed (qservID)"
         },
         "ownerID": {
           "type": "string",
@@ -333,7 +406,7 @@ further into the implementation.
 ### Example job delete event
 
     {
-      "qservID": "qserv-123",
+      "executionID": "qserv-123",
       "ownerID": "me"
     }
 
@@ -350,14 +423,14 @@ further into the implementation.
           "type": "string",
           "description": "UWS job ID"
         },
-        "qservID": {
+        "executionID": {
           "type": "string",
-          "description": "QServ query ID"
+          "description": "Internal ID of the job being executed (qservID)"
         },
         "timestamp": {
           "type": "string",
-          "format": "date-time",
-          "description": "Time of this status update"
+          "format": "date-time-millis",
+          "description": "Time of this status update in millisecond precision"
         },
         "status": {
           "type": "string",
@@ -370,12 +443,12 @@ further into the implementation.
           "properties": {
             "startTime": {
               "type": "string",
-              "format": "date-time",
+              "format": "date-time-millis",
               "description": "Time when query execution started"
             },
             "endTime": {
               "type": "string",
-              "format": "date-time",
+              "format": "date-time-millis",
               "description": "Time when query execution completed"
             },
             "duration": {
@@ -409,12 +482,22 @@ further into the implementation.
               "description": "GCS URL where results were written"
             },
             "format": {
-              "type": "string",
-              "enum": ["votable"],
-              "description": "Format of the result file"
-            },
+              "type": "object",
+              "properties": {
+		"type": {
+                  "type": "string",
+                  "enum": ["votable"],
+                  "description": "Base format type of the result file"
+		},
+		"serialization": {
+                  "type": "string",
+                  "enum": ["tabledata", "binary2"],
+                  "description": "Serialization method used for the format"
+		}
+              }
+            }
           }
-        },
+        }
         "errorInfo": {
           "type": "object",
           "description": "Information about any errors that occurred",
@@ -462,21 +545,23 @@ further into the implementation.
 
     {
       "jobID": "uws-123",
-      "qservID": "qserv-123",
-      "timestamp": "2025-03-19T..",
+      "executionID": "qserv-123",
+      "timestamp": "1711638729477",
       "status": "COMPLETED",
       "queryInfo": {
-        "startTime": "2025-03-18T..",
-        "endTime": "2025-03-19T..",
+        "startTime": "1711638729457",
+        "endTime": "1711638729477",
         "duration": 214,
         "totalChunks": 167,
         "completedChunks": 167
       },
       "resultInfo": {
+        "format": {
+          "type": "votable",
+          "serialization": "binary2"
+        },
         "totalRows": 1000,
         "resultLocation": "https://bucket/results_uws123.xml",
-        "format": "votable",
-        "sizeBytes": 128456
       },
       "metadata": {
         "query": "SELECT TOP 10 * FROM table",
@@ -488,12 +573,12 @@ further into the implementation.
 
     {
       "jobID": "uws-123",
-      "qservID": "qserv-123",
-      "timestamp": "2025-03-19T..",
+      "executionID": "qserv-123",
+      "timestamp": "1711638729477",
       "status": "ERROR",
       "queryInfo": {
-        "startTime": "2025-03-19T..",
-        "endTime": "2025-03-19T..",
+        "startTime": "1711638729477",
+        "endTime": "1711638729477",
         "duration": 3,
         "totalChunks": 3,
         "completedChunks": 1
@@ -556,7 +641,7 @@ provide the base URL to QServ so that it can use this in the access_url field of
 In the proposal here, we include the base URL in the metadata provided in the lsst.tap.job-run event, 
 which QServ can then use to construct the access_url field in the VOTable.
 
-### Should QServ be aware of the UWS job? 
+### Should QServ adapter be aware of the UWS job? 
 
 Should we be passing the uws jobID to it, or is the job identification done purely via the qserv query ID? 
 We will have both a qservID and uws jobID in our table, but in the case we use the qserv query ID for this it needs to be indexed.
@@ -575,10 +660,14 @@ The event queue would continue to fill up with query events. Once QServ is
 back up and running, we need to decide if we start from the last offset, i.e. 
 run all queries that were added to the queue, or if we want to have it auto-reset to the latest event. The potential issue with the first approach, is that if the queue grows quite a bit until QServ recovers, it may take a long time to process all events until it is able to start processing the newest ones. From the user’s point of view newer queries will be stuck as HELD for a while, while on the other hand, in all likelihood users would not be actively polling older jobs if they haven’t returned within a reasonable amount of time.
 
+Update: In the updated design where we use the QServ adapter, we either have to configure the adapter to stop pulling jobs until QServ is back, or we live with the fact that jobs will be lost in the meantime.
+
 ### Authentication
 
 Qserv is at USDF so we need to figure out the best authentication story here so that Kafka consumer/producer can interact with the cloud idfs. 
 This includes egress traffic from USDF to the cloud, and also ingress traffic from the cloud to USDF.
+In the updated design where we are using a QServ adapter in front of QServ to handle the Kafka interactions, the authentication story is different, and we now need to ensure that we can access the HTTP and SQL interfaces from Cloud to USDF>
+
 
 ### Authorization for query deletion
 
@@ -589,14 +678,15 @@ check that the user is the owner of the job before sending the delete
 event, or QServ needs to check this before deleting the job.
 Probably the best approach is to have the TAP service to do this check.
 
-## 7. QServ Change Requirements
+## 7. QServ adapter Change Requirements
 
 ### Add Kafka consumer and Producer
 
-Add a Kafka consumer in the QServ app which will read from the lsst.tap.job-run, 
+Add a Kafka consumer in the QServ adapter app which will read from the lsst.tap.job-run, 
 lsst.tap.job-delete topics and act on the messages received.
 
-Add a Kafka producer in QServ which will send out events for lsst.tap.job-status updates, including:
+
+Add a Kafka producer in the QServ adapter which will send out events for lsst.tap.job-status updates, including:
 - Job is running
 - Job has completed, either successfully or with failure
 
@@ -642,6 +732,8 @@ service update the UWS job with this error message. In the case of a
 synchronous query the TAP service will then have to generate the VOTable 
 which will contain this error message it got from the lsst.tap.job-status event.
 
+## 8. QServ adapter Change Requirements
+
 ### Datalink access_urls
 
 As mentioned above, we need to figure out a way to provide the base URL to QServ 
@@ -661,7 +753,7 @@ to indicate the field name to format, and how to format the row values.
 
 
 
-## 8. TAP Service Change Requirements
+## 9. TAP Service Change Requirements
 
 ### TAP Kafka Consumer
 
