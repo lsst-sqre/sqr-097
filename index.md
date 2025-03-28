@@ -247,35 +247,77 @@ further into the implementation.
           "type": "string",
           "description": "Signed GCS URL where QServ should write the results"
         },
-        "resultFormat": {
-          "type": "object",
-          "required": ["type", "envelope"],
-          "properties": {
-            "type": {
-              "type": "string",
-              "enum": ["votable"],
-              "description": "Format of the result file"
-            },
-            "envelope": {
-              "type": "object",
-              "required": ["header", "footer"],
-              "properties": {
-                "header": {
-                  "type": "string",
-                  "description": "VOTable header with metadata structure"
-                },
-                "footer": {
-                  "type": "string",
-                  "description": "VOTable footer to close the XML structure"
-                },
-                "baseUrl": {
-                  "type": "string",
-                  "description": "Base URL to use for access_url fields in results"
-                },
-              }
-            }
-          }
-        },
+        "resultLocation": {
+	  "type": "string",
+	  "description": "Optional result location for tracking purposes",
+	},
+	"resultFormat": {
+	  "type": "object",
+	  "required": ["format", "envelope", "columnTypes"],
+	  "properties": {
+	    "format": {
+	      "type": "object",
+	      "required": ["type", "serialization"],
+	      "properties": {
+		"type": {
+		  "type": "string",
+		  "enum": ["votable"],
+		  "description": "Base format type of the result file"
+		},
+		"serialization": {
+		  "type": "string",
+		  "enum": ["tabledata", "binary2"],
+		  "description": "Serialization method used for the format"
+		}
+	      }
+	    },
+	    "envelope": {
+	      "type": "object",
+	      "required": ["header", "footer"],
+	      "properties": {
+		"header": {
+		  "type": "string",
+		  "description": "VOTable header with metadata structure"
+		},
+		"footer": {
+		  "type": "string",
+		  "description": "VOTable footer to close the XML structure"
+		}
+	      }
+	    },
+	    "columnTypes": {
+	      "type": "array",
+	      "description": "Array of column type information",
+	      "items": {
+		"type": "object",
+		"required": ["name", "datatype"],
+		"properties": {
+		  "name": {
+		    "type": "string",
+		    "description": "Column name"
+		  },
+		  "datatype": {
+		    "type": "string",
+		    "description": "VOTable datatype"
+		  },
+		  "arraysize": {
+		    "type": "string",
+		    "description": "Optional array size specification for the column"
+		  },
+		  "requiresUrlRewrite": {
+		    "type": "boolean",
+		    "description": "Flag indicating if this column needs URL rewriting",
+		    "default": false
+		  }
+		}
+	      }
+	    },
+	    "baseUrl": {
+	      "type": "string",
+	      "description": "Base URL to use for access_url fields that require rewriting"
+	    }
+	  }
+	},
         "uploadTable": {
           "type": "object",
           "description": "Optional information for TAP_UPLOAD queries",
@@ -287,7 +329,7 @@ further into the implementation.
             "sourceUrl": {
               "type": "string",
               "description": "GCS URL where the uploaded file was stored by TAP"
-            },
+            }
           }
         },
         "timeout": {
@@ -305,14 +347,41 @@ further into the implementation.
       "jobID": "uws123",
       "ownerID": "me",
       "resultDestination": "https://bucket/results_uws123.xml?X-Goog-Signature=a82c76...",
+      "resultLocation": "https://bucket/results_uws123.xml",
       "resultFormat": {
-        "type": "votable",
+        "format": {
+          "type": "votable",
+          "serialization": "binary2"
+        },
         "envelope": {
           "header": "<VOTable xmlns=\"http://www.ivoa.net/xml/VOTable/v1.3\" version=\"1.3\"><RESOURCE type=\"results\"><TABLE><FIELD ID=\"col_0\" arraysize=\"*\" datatype=\"char\" name=\"col1\"/>",
           "footer": "</TABLE></RESOURCE></VOTable>"
+        },
+        "columnTypes": [
+          {
+            "name": "object_id",
+            "datatype": "long"
+          },
+          {
+            "name": "ra",
+            "datatype": "double"
+          },
+          {
+            "name": "dec",
+            "datatype": "double"
+          },
+          {
+            "name": "access_url",
+            "datatype": "char",
+            "arraysize": "*",
+            "requiresUrlRewrite": true
+          }
+        ],
+        "baseUrl": "https://data-dev.lsst.cloud/"
         }
       }
-    }
+
+
 
 
 ## 3.2 Job deletion
@@ -321,11 +390,11 @@ further into the implementation.
 
     {
       "type": "object",
-      "required": ["qservID"],
+      "required": ["executionID"],
       "properties": {
-        "qservID": {
+        "executionID": {
           "type": "string",
-          "description": "QServ query ID"
+          "description": "Internal ID of the job being executed (qservID)"
         },
         "ownerID": {
           "type": "string",
@@ -337,7 +406,7 @@ further into the implementation.
 ### Example job delete event
 
     {
-      "qservID": "qserv-123",
+      "executionID": "qserv-123",
       "ownerID": "me"
     }
 
@@ -354,14 +423,14 @@ further into the implementation.
           "type": "string",
           "description": "UWS job ID"
         },
-        "qservID": {
+        "executionID": {
           "type": "string",
-          "description": "QServ query ID"
+          "description": "Internal ID of the job being executed (qservID)"
         },
         "timestamp": {
           "type": "string",
-          "format": "date-time",
-          "description": "Time of this status update"
+          "format": "date-time-millis",
+          "description": "Time of this status update in millisecond precision"
         },
         "status": {
           "type": "string",
@@ -374,12 +443,12 @@ further into the implementation.
           "properties": {
             "startTime": {
               "type": "string",
-              "format": "date-time",
+              "format": "date-time-millis",
               "description": "Time when query execution started"
             },
             "endTime": {
               "type": "string",
-              "format": "date-time",
+              "format": "date-time-millis",
               "description": "Time when query execution completed"
             },
             "duration": {
@@ -413,12 +482,22 @@ further into the implementation.
               "description": "GCS URL where results were written"
             },
             "format": {
-              "type": "string",
-              "enum": ["votable"],
-              "description": "Format of the result file"
-            },
+              "type": "object",
+              "properties": {
+		"type": {
+                  "type": "string",
+                  "enum": ["votable"],
+                  "description": "Base format type of the result file"
+		},
+		"serialization": {
+                  "type": "string",
+                  "enum": ["tabledata", "binary2"],
+                  "description": "Serialization method used for the format"
+		}
+              }
+            }
           }
-        },
+        }
         "errorInfo": {
           "type": "object",
           "description": "Information about any errors that occurred",
@@ -466,21 +545,23 @@ further into the implementation.
 
     {
       "jobID": "uws-123",
-      "qservID": "qserv-123",
-      "timestamp": "2025-03-19T..",
+      "executionID": "qserv-123",
+      "timestamp": "1711638729477",
       "status": "COMPLETED",
       "queryInfo": {
-        "startTime": "2025-03-18T..",
-        "endTime": "2025-03-19T..",
+        "startTime": "1711638729457",
+        "endTime": "1711638729477",
         "duration": 214,
         "totalChunks": 167,
         "completedChunks": 167
       },
       "resultInfo": {
+        "format": {
+          "type": "votable",
+          "serialization": "binary2"
+        },
         "totalRows": 1000,
         "resultLocation": "https://bucket/results_uws123.xml",
-        "format": "votable",
-        "sizeBytes": 128456
       },
       "metadata": {
         "query": "SELECT TOP 10 * FROM table",
@@ -492,12 +573,12 @@ further into the implementation.
 
     {
       "jobID": "uws-123",
-      "qservID": "qserv-123",
-      "timestamp": "2025-03-19T..",
+      "executionID": "qserv-123",
+      "timestamp": "1711638729477",
       "status": "ERROR",
       "queryInfo": {
-        "startTime": "2025-03-19T..",
-        "endTime": "2025-03-19T..",
+        "startTime": "1711638729477",
+        "endTime": "1711638729477",
         "duration": 3,
         "totalChunks": 3,
         "completedChunks": 1
