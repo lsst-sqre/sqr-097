@@ -27,7 +27,7 @@ While this architecture is functional and serves most use cases effectively, it 
 These types of queries have the potential to overwhelm the system at high concurrency and the current JDBC-based implementation lacks core operational capabilities that would help alleviate this, specifically a mechanism to stop executing queries once started and monitoring capabilities for users for these long-running queries.
 
 The use-case scenario we would like to support that is not currently possible is allowing users to identify that a query has been running longer than they expected, to stop this potentially inefficient query, modify its parameters and restart it.
-                                                
+
 
 ### 1.3 Goals and Requirements
 
@@ -617,6 +617,37 @@ The proposal for this technote is to aim to implement BINARY2 serialization
 for the initial implementation, with a backup plan to use TABLEDATA if
 BINARY2 is not feasible, and a longer-term goal of moving to VOTable-in-parquet
 once it is ready.
+
+## Datatypes
+
+We need to ensure that we maintain the data type integrity throughout the data flow.
+In terms of the VOTable field metadata,0 the source of truth will be the TAP service which will
+provide the VOTable wrapper that includes the fields to the qserv adapter. The qserv adapter service
+will then inject the data stream, leaving the field metadata as-is which will ensure consistency of the field metadata.
+
+In terms of the conversion of row data, the process we use is that we pass in the field metadata as a json object with our request
+to the adapter, which in turn maintains a simple mapping of IVOA datatype to MySQL (QServ) type, and uses this to collect the results
+from the sql client into python primitive types, and then serializes them into a BINARY2 stream using those types.
+
+We've collected a list of known types that will have to be handled through a combination of parsing the TAP_SCHEMA columns table as well
+as the sdm_schemas for dp02 and obscore. These types which we ensure will be handled are the following:
+
+
+The list of available datatypes for DP1 include:
+
+- char
+- long
+- double
+- float
+- boolean
+- int
+
+From the above, the only datatypes for which we expect to have arraysizes that are not null are those of type char.
+
+
+Note that more complex types like arrays of numerical types are not on our schedule for the initial release (DP1), but we may decide to 
+extend our capabilities for handling these types if it becomes a requirement for future releases.
+
 
 ## 5. Kafka Topics Structure
 
