@@ -261,12 +261,12 @@ further into the implementation.
 	      "properties": {
 		"type": {
 		  "type": "string",
-		  "enum": ["votable"],
+		  "enum": ["VOTable"],
 		  "description": "Base format type of the result file"
 		},
 		"serialization": {
 		  "type": "string",
-		  "enum": ["tabledata", "binary2"],
+		  "enum": ["TABLEDATA", "BINARY2"],
 		  "description": "Serialization method used for the format"
 		}
 	      }
@@ -350,12 +350,12 @@ further into the implementation.
       "resultLocation": "https://bucket/results_uws123.xml",
       "resultFormat": {
         "format": {
-          "type": "votable",
-          "serialization": "binary2"
+          "type": "VOTable",
+          "serialization": "BINARY2"
         },
         "envelope": {
-          "header": "<VOTable xmlns=\"http://www.ivoa.net/xml/VOTable/v1.3\" version=\"1.3\"><RESOURCE type=\"results\"><TABLE><FIELD ID=\"col_0\" arraysize=\"*\" datatype=\"char\" name=\"col1\"/>",
-          "footer": "</TABLE></RESOURCE></VOTable>"
+          "header": "<VOTABLE xmlns=\"http://www.ivoa.net/xml/VOTable/v1.3\" version=\"1.3\"><RESOURCE type=\"results\"><TABLE><FIELD ID=\"col_0\" arraysize=\"*\" datatype=\"char\" name=\"col1\"/>",
+          "footer": "</TABLE></RESOURCE></VOTABLE>"
         },
         "columnTypes": [
           {
@@ -486,12 +486,12 @@ further into the implementation.
               "properties": {
 		"type": {
                   "type": "string",
-                  "enum": ["votable"],
+                  "enum": ["VOTable"],
                   "description": "Base format type of the result file"
 		},
 		"serialization": {
                   "type": "string",
-                  "enum": ["tabledata", "binary2"],
+                  "enum": ["TABLEDATA", "BINARY2"],
                   "description": "Serialization method used for the format"
 		}
               }
@@ -557,8 +557,8 @@ further into the implementation.
       },
       "resultInfo": {
         "format": {
-          "type": "votable",
-          "serialization": "binary2"
+          "type": "VOTable",
+          "serialization": "BINARY2"
         },
         "totalRows": 1000,
         "resultLocation": "https://bucket/results_uws123.xml",
