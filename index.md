@@ -231,6 +231,10 @@ further into the implementation.
           "type": "string",
           "description": "The SQL query to be executed by QServ"
         },
+        "maxrec": {
+          "type": "string",
+          "description": "The TAP MAXREC parameter indicating maximum row limit"
+        },        
         "database": {
           "type": "string",
           "description": "The database to query, e.g., 'dp1'"
@@ -273,7 +277,7 @@ further into the implementation.
 	    },
 	    "envelope": {
 	      "type": "object",
-	      "required": ["header", "footer"],
+	      "required": ["header", "footer", "footerOverflow"],
 	      "properties": {
 		"header": {
 		  "type": "string",
@@ -282,7 +286,11 @@ further into the implementation.
 		"footer": {
 		  "type": "string",
 		  "description": "VOTable footer to close the XML structure"
-		}
+		},
+		"footerOverflow": {
+		  "type": "string",
+		  "description": "VOTable footer to close the XML structure, including an overflow message to indicate data truncation"
+		}		
 	      }
 	    },
 	    "columnTypes": {
@@ -343,6 +351,7 @@ further into the implementation.
 
     {
       "query": "SELECT TOP 10 * FROM table",
+      "maxrec": 1000, 
       "database": "dp1",
       "jobID": "uws123",
       "ownerID": "me",
@@ -355,7 +364,8 @@ further into the implementation.
         },
         "envelope": {
           "header": "<VOTABLE xmlns=\"http://www.ivoa.net/xml/VOTable/v1.3\" version=\"1.3\"><RESOURCE type=\"results\"><TABLE><FIELD ID=\"col_0\" arraysize=\"*\" datatype=\"char\" name=\"col1\"/>",
-          "footer": "</TABLE></RESOURCE></VOTABLE>"
+          "footer": "</TABLE></RESOURCE></VOTABLE>",
+          "footerOverflow": "</TABLE><INFO name=\"QUERY_STATUS\" value=\"OVERFLOW\"/></RESOURCE></VOTABLE>"
         },
         "columnTypes": [
           {
@@ -390,11 +400,15 @@ further into the implementation.
 
     {
       "type": "object",
-      "required": ["executionID"],
+      "required": ["executionID", "jobID"],
       "properties": {
         "executionID": {
           "type": "string",
           "description": "Internal ID of the job being executed (qservID)"
+        },
+        "jobID": {
+          "type": "string",
+          "description": "The UWS jobID"
         },
         "ownerID": {
           "type": "string",
@@ -407,6 +421,7 @@ further into the implementation.
 
     {
       "executionID": "qserv-123",
+      "jobID" : "uws123",
       "ownerID": "me"
     }
 
