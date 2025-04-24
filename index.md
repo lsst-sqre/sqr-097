@@ -232,7 +232,7 @@ further into the implementation.
           "description": "The SQL query to be executed by QServ"
         },
         "maxrec": {
-          "type": "string",
+          "type": "integer",
           "description": "The TAP MAXREC parameter indicating maximum row limit"
         },        
         "database": {
