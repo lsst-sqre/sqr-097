@@ -326,20 +326,27 @@ further into the implementation.
 	    }
 	  }
 	},
-        "uploadTable": {
-          "type": "object",
-          "description": "Optional information for TAP_UPLOAD queries",
-          "properties": {
-            "tableName": {
-              "type": "string",
-              "description": "Name to give the uploaded table in QServ"
-            },
-            "sourceUrl": {
-              "type": "string",
-              "description": "GCS URL where the uploaded file was stored by TAP"
-            }
-          }
-        },
+	"uploadTables": {
+	  "type": "array",
+	  "description": "Optional information for TAP_UPLOAD queries - can include multiple tables",
+	  "items": {
+	    "type": "object",
+	    "properties": {
+	      "tableName": {
+		"type": "string",
+		"description": "Name to give the uploaded table in QServ"
+	      },
+	      "sourceUrl": {
+		"type": "string",
+		"description": "GCS URL where the uploaded file was stored by TAP"
+	      },
+	      "schemaUrl": {
+		"type": "string",
+		"description": "GCS URL where the schema for the uploaded file was stored by TAP"
+	      }
+	    }
+	  }
+	},
         "timeout": {
           "type": "integer",
           "description": "Optional timeout in seconds for query execution"
